@@ -103,7 +103,7 @@ jobs:
           tagName: ${{ github.ref_type == 'tag' && github.ref_name || 'ci-latest' }}
           releaseName: ${{ github.ref_type == 'tag' && github.ref_name || 'CI latest build' }}
           releaseDraft: false
-          releasePrerelease: ${{ github.ref_type != 'tag' }}
+          prerelease: ${{ github.ref_type != 'tag' }}
 
       # Best-effort secondary copy. The repo's Actions *artifact* storage quota
       # is frequently full; when it is, this step fails but MUST NOT fail the

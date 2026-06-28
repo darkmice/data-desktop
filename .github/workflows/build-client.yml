@@ -23,7 +23,30 @@ permissions:
   contents: write
 
 jobs:
+  # On a manual (workflow_dispatch) run, wipe the rolling "ci-latest" release
+  # first so the matrix jobs re-create it cleanly. Without this, re-running the
+  # workflow makes each platform try to upload an asset name that already exists
+  # on the previous ci-latest release -> "ReleaseAsset already_exists" failure.
+  # Runs ONCE (not per-matrix), so there is no concurrent-delete race.
+  prepare:
+    if: github.ref_type != 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Delete stale ci-latest release (keep going if absent)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release delete ci-latest \
+            --repo "${{ github.repository }}" \
+            --cleanup-tag --yes || echo "no existing ci-latest release"
+
   build:
+    needs: [prepare]
+    # `prepare` is skipped on tag pushes; `always()` lets build run anyway, and
+    # we only fail build if prepare actually failed (not when it was skipped).
+    if: always() && (needs.prepare.result == 'success' || needs.prepare.result == 'skipped')
     strategy:
       fail-fast: false
       matrix:

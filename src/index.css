@@ -1,0 +1,39 @@
+/* Talon tokens(CSS 变量)必须在 tailwind 之前导入,base 层才能读到。 */
+@import '@talon-ui/tokens/css';
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* 全局基底:深色仪表盘,JetBrains Mono + Noto Sans SC 备用(本地无网时退化系统字体)。 */
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+body {
+  background: var(--tp-bg-app, #0b0f12);
+  color: var(--tp-text-primary, #cdd9e0);
+  font-family: 'Noto Sans SC', system-ui, -apple-system, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* 选中态用主题色(深色上默认蓝底看不清);说明性 UI 不可拖选,输入/表格放开。 */
+::selection {
+  background: var(--tp-primary-600, #4f60ff);
+  color: #ffffff;
+}
+body {
+  user-select: none;
+}
+input,
+textarea,
+.selectable {
+  user-select: text;
+}
+
+/* 等宽数字/编号 */
+.mono {
+  font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, monospace;
+}

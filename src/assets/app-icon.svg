@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" role="img" aria-labelledby="title desc">
+  <title id="title">DataScope app icon</title>
+  <desc id="desc">Square app icon for a data research product, built from the same semantic mark as the primary logo.</desc>
+  <rect id="app-tile" x="32" y="32" width="448" height="448" rx="104" fill="#12263f"/>
+  <g id="grid" opacity="1">
+    <path id="grid-x-1" d="M136 154 H376" stroke="#284861" stroke-width="5" stroke-linecap="round"/>
+    <path id="grid-x-2" d="M136 246 H376" stroke="#284861" stroke-width="5" stroke-linecap="round"/>
+    <path id="grid-x-3" d="M136 338 H376" stroke="#284861" stroke-width="5" stroke-linecap="round"/>
+    <path id="grid-y-1" d="M164 126 V374" stroke="#284861" stroke-width="5" stroke-linecap="round"/>
+    <path id="grid-y-2" d="M256 126 V374" stroke="#284861" stroke-width="5" stroke-linecap="round"/>
+    <path id="grid-y-3" d="M348 126 V374" stroke="#284861" stroke-width="5" stroke-linecap="round"/>
+  </g>
+  <path id="insight-path" pathLength="1" d="M148 328 C196 280 218 294 256 244 C290 200 320 200 364 160" fill="none" stroke="#35d0ba" stroke-width="28" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle id="node-a" cx="148" cy="328" r="20" fill="#ffffff"/>
+  <circle id="node-b" cx="256" cy="244" r="20" fill="#ffffff"/>
+  <circle id="node-c" cx="364" cy="160" r="20" fill="#ffffff"/>
+  <circle id="scope-ring" cx="240" cy="236" r="112" fill="none" stroke="#f4f7fb" stroke-width="30"/>
+  <path id="scope-handle" d="M320 316 L394 390" stroke="#f4f7fb" stroke-width="36" stroke-linecap="round"/>
+  <circle id="research-focus" cx="240" cy="236" r="46" fill="#4f8cff" opacity="0.18"/>
+</svg>

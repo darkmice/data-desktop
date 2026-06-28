@@ -1,0 +1,183 @@
+//! Credential (凭证) parsing and real-param extraction.
+//! Ported from Python `order.py` `_get_real_params` / `_extract_*`.
+
+use std::collections::BTreeMap;
+
+use serde::{Deserialize, Serialize};
+
+/// A stored credential set (one "凭证" = one cookie jar + remark name).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Credential {
+    /// User-defined remark name (e.g. "6715").
+    pub name: String,
+    /// Raw cookie string as pasted from the browser.
+    pub cookie_str: String,
+    /// Whether this credential is currently usable (cleared on rotation).
+    #[serde(default = "default_true")]
+    pub valid: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// Browser params the order body/params need, extracted from cookies.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RealParams {
+    pub device_uuid: String,
+    pub address_id: String,
+    pub location_id: String,
+    pub eid_token: String,
+}
+
+/// Parse a cookie string ("k1=v1; k2=v2") into an ordered map.
+pub fn parse_cookies(cookie_str: &str) -> BTreeMap<String, String> {
+    let mut map = BTreeMap::new();
+    for pair in cookie_str.split(';') {
+        let pair = pair.trim();
+        if let Some((k, v)) = pair.split_once('=') {
+            let k = k.trim();
+            if !k.is_empty() {
+                map.insert(k.to_string(), v.trim().to_string());
+            }
+        }
+    }
+    map
+}
+
+/// True if the cookie jar carries a login token.
+pub fn has_pt_key(cookies: &BTreeMap<String, String>) -> bool {
+    cookies.contains_key("pt_key")
+}
+
+/// 下单必需的关键 cookie key(缺任一则该 CK 不可用于下单)。
+/// 经实测确认:CK 必须完整携带这些登录 + 风控设备指纹项,缺了即使签名完美也会被风控拦下。
+pub const REQUIRED_KEYS: &[&str] = &[
+    "pt_key",
+    "pt_pin",
+    "3AB9D23F7A4B3C9B",
+    "3AB9D23F7A4B3CSS",
+    "__jda",
+    "shshshfpa",
+    "shshshfpb",
+    "shshshfpx",
+    "shshshfpv",
+    "unionwsws",
+];
+
+/// 返回 CK 中缺失的关键 key(按 REQUIRED_KEYS 顺序)。空 = 齐全。
+/// 只判断"在不在"且值非空——不判断值是否正确。
+pub fn missing_required_keys(cookies: &BTreeMap<String, String>) -> Vec<&'static str> {
+    REQUIRED_KEYS
+        .iter()
+        .filter(|k| cookies.get(**k).map(|v| v.trim().is_empty()).unwrap_or(true))
+        .copied()
+        .collect()
+}
+
+/// Extract the device/address params, mirroring Python `_get_real_params`.
+pub fn extract_real_params(cookies: &BTreeMap<String, String>) -> RealParams {
+    let device_uuid = cookies
+        .get("visitkey")
+        .cloned()
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            cookies
+                .get("__jda")
+                .and_then(|v| v.split('.').nth(1).map(str::to_string))
+        })
+        .unwrap_or_else(|| "0".to_string());
+
+    let eid_token = cookies.get("3AB9D23F7A4B3C9B").cloned().unwrap_or_default();
+
+    let mut address_id = cookies.get("commonAddress").cloned().unwrap_or_default();
+    let mut location_id = cookies
+        .get("mitemAddrId")
+        .map(|v| v.replace('_', "-"))
+        .unwrap_or_default();
+
+    if location_id.is_empty() || address_id.is_empty() {
+        if let Some(iploc) = cookies.get("ipLoc-djd") {
+            let parts: Vec<&str> = iploc.split('.').collect();
+            if parts.len() == 2 {
+                if location_id.is_empty() {
+                    location_id = parts[0].to_string();
+                }
+                if address_id.is_empty() {
+                    address_id = parts[1].to_string();
+                }
+            }
+        }
+    }
+
+    RealParams {
+        device_uuid,
+        address_id,
+        location_id,
+        eid_token,
+    }
+}
+
+/// Build the `Cookie:` header value from a credential's cookie string.
+pub fn cookie_header(cookies: &BTreeMap<String, String>) -> String {
+    cookies
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SAMPLE: &str = "visitkey=8254774041151190157; __jda=1.devuuid.x; 3AB9D23F7A4B3C9B=EIDTOK; commonAddress=0; mitemAddrId=1_72_55674_0; pt_key=AAJ";
+
+    #[test]
+    fn extracts_real_params() {
+        let c = parse_cookies(SAMPLE);
+        let rp = extract_real_params(&c);
+        assert_eq!(rp.device_uuid, "8254774041151190157");
+        assert_eq!(rp.eid_token, "EIDTOK");
+        assert_eq!(rp.address_id, "0");
+        assert_eq!(rp.location_id, "1-72-55674-0");
+    }
+
+    #[test]
+    fn device_uuid_falls_back_to_jda() {
+        let c = parse_cookies("__jda=1.devuuid.x");
+        assert_eq!(extract_real_params(&c).device_uuid, "devuuid");
+    }
+
+    #[test]
+    fn detects_pt_key() {
+        assert!(has_pt_key(&parse_cookies(SAMPLE)));
+        assert!(!has_pt_key(&parse_cookies("a=b")));
+    }
+
+    #[test]
+    fn missing_keys_lists_each_absent_required() {
+        // SAMPLE 只有 pt_key/__jda/3AB9D23F7A4B3C9B,缺其余必需项。
+        let missing = missing_required_keys(&parse_cookies(SAMPLE));
+        assert!(missing.contains(&"pt_pin"));
+        assert!(missing.contains(&"3AB9D23F7A4B3CSS"));
+        assert!(missing.contains(&"shshshfpb"));
+        assert!(missing.contains(&"unionwsws"));
+        assert!(!missing.contains(&"pt_key"));
+        assert!(!missing.contains(&"__jda"));
+    }
+
+    #[test]
+    fn complete_ck_has_no_missing() {
+        let full: String = REQUIRED_KEYS.iter().map(|k| format!("{k}=x; ")).collect();
+        assert!(missing_required_keys(&parse_cookies(&full)).is_empty());
+    }
+
+    #[test]
+    fn empty_value_counts_as_missing() {
+        let c = parse_cookies("pt_key=; pt_pin=abc");
+        let missing = missing_required_keys(&c);
+        assert!(missing.contains(&"pt_key")); // 空值视为缺失
+        assert!(!missing.contains(&"pt_pin"));
+    }
+}

@@ -1,0 +1,31 @@
+# ---- Rust / Tauri ----
+target/
+src-tauri/target/
+**/*.rs.bk
+*.pdb
+
+# ---- Node / frontend ----
+node_modules/
+dist/
+_legacy_dist/
+*.tsbuildinfo
+
+# ---- Tauri generated ----
+src-tauri/gen/
+
+# ---- Secrets / local data (NEVER commit) ----
+*.db
+*.db-shm
+*.db-wal
+.env
+.env.*
+*.pem
+*.key
+id.txt
+localStorage.json
+
+# ---- OS / editor ----
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

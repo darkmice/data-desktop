@@ -117,7 +117,7 @@ jobs:
           # insecure all-0x07 dev placeholder key.
           DATA_ACCESS_KEY: ${{ secrets.DATA_ACCESS_KEY }}
         with:
-          args: --target ${{ matrix.target }}
+          args: --target ${{ matrix.target }} --verbose
           # tauri-action creates/updates a GitHub Release and uploads the
           # installers. Release assets do NOT count against the Actions artifact
           # storage quota, so this is the reliable distribution path. On a tag

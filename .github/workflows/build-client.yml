@@ -95,16 +95,22 @@ jobs:
           DATA_ACCESS_KEY: ${{ secrets.DATA_ACCESS_KEY }}
         with:
           args: --target ${{ matrix.target }}
-          # When run on a tag push, tauri-action creates/updates the GitHub
-          # Release and uploads the installers. On workflow_dispatch (no tag)
-          # it just builds; we grab the bundles via upload-artifact below.
-          tagName: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
-          releaseName: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+          # tauri-action creates/updates a GitHub Release and uploads the
+          # installers. Release assets do NOT count against the Actions artifact
+          # storage quota, so this is the reliable distribution path. On a tag
+          # push -> Release named after the tag; on a manual run -> a rolling
+          # "ci-latest" prerelease so installers are always downloadable.
+          tagName: ${{ github.ref_type == 'tag' && github.ref_name || 'ci-latest' }}
+          releaseName: ${{ github.ref_type == 'tag' && github.ref_name || 'CI latest build' }}
           releaseDraft: false
-          releasePrerelease: false
+          releasePrerelease: ${{ github.ref_type != 'tag' }}
 
-      - name: Upload installers as workflow artifacts
+      # Best-effort secondary copy. The repo's Actions *artifact* storage quota
+      # is frequently full; when it is, this step fails but MUST NOT fail the
+      # job — the installers are already published to the Release above.
+      - name: Upload installers as workflow artifacts (best-effort)
         if: always()
+        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
           name: client-${{ matrix.label }}

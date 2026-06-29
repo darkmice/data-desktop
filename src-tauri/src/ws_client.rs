@@ -12,7 +12,7 @@ use tokio_tungstenite::Connector;
 use tungstenite::client::IntoClientRequest;
 use tungstenite::Message;
 
-use crate::core::order::Signer;
+use crate::core::order::{Signer, ORDER_CLIENT_PLATFORM};
 
 /// Events surfaced from the WS connection to the app layer.
 #[derive(Debug, Clone)]
@@ -308,6 +308,12 @@ impl Signer for WsClient {
             "appid": "m_core",
             // 与请求参数 clientVersion 一致(真实抓包为 3.0.8)。
             "client_version": "3.0.8",
+            // ⭐ 关键:必须把 client(navigator.platform)传给服务端签名,且与下单 form 的
+            // client 字段【完全一致】。服务端据此设 navigator.platform(烘进 seg7 指纹);
+            // 若不传,服务端 fallback=iPhone,而 form 写死 MacIntel → seg7 自相矛盾 → JD 601。
+            // 这是客户端一直 601 的真因(h5st-probe 全链 MacIntel 一致才成功)。
+            // 与 order::build_params 的 ("client","MacIntel") 必须保持同值。
+            "client": ORDER_CLIENT_PLATFORM,
             "sign_app_id": sign_app_id,
             "raw_body": raw_body,
             "t": t,

@@ -12,6 +12,11 @@ use crate::core::ck::{self, Credential, RealParams};
 
 const ORDER_URL: &str = "https://api.m.jd.com/client.action";
 
+/// 下单链路统一的 `client`(= navigator.platform)。**签名(WS 传给服务端)与下单
+/// form 必须用同一个值**,否则 seg7 指纹自相矛盾 → JD 601。h5st-probe 验证过的成功
+/// 环境是全链 MacIntel。ws_client.rs 的 WS sign 请求引用此常量,build_params 也用它。
+pub const ORDER_CLIENT_PLATFORM: &str = "MacIntel";
+
 /// Result of a full order attempt.
 #[derive(Debug, Clone, Default)]
 pub struct OrderResult {
@@ -76,6 +81,10 @@ pub trait OrderHttp: Send + Sync {
 /// 之后再下单直接跳过该凭证(连签名都不发)——这是之前的 bug。601 的处理见
 /// order_once_inner:Step1 拿到 601 直接 fail 返回,但【不】触发轮换、不禁用凭证。
 fn needs_rotation(err: &str) -> bool {
+    // 601 一律不轮换(诊断串可能内嵌任意响应文本,先短路避免误判)。
+    if err.starts_with("601") {
+        return false;
+    }
     // 只认明确的登录态失效信号(302=CK过期 / 未登录 / 登录失效 / 请先登录 / expired)。
     // 不含 "601"、不含过宽的 "invalid"(601 的 errorReason 可能含 invalid 误伤)。
     const KW: &[&str] = &["302", "未登录", "登录失效", "请先登录", "expired", "no access"];
@@ -467,36 +476,25 @@ fn build_params(
     t: i64,
     rp: &RealParams,
 ) -> Vec<(String, String)> {
-    // client / screen / lang 跟随运行环境(浏览器/OS/语言/视口),京东不校验具体值,
-    // 固定一组合理默认 = 成功实测环境(MacIntel / 390*844 / en-US)。其余为业务固定值。
-    let mut p: Vec<(String, String)> = vec![
-        ("client", "MacIntel"),
-        ("clientVersion", "3.0.8"),
-        ("osVersion", "other"),
-        ("screen", "390*844"),
-        ("networkType", "false"),
-        ("d_brand", ""),
-        ("d_model", ""),
-        ("lang", "en-US"),
-        ("sdkVersion", "3.0.8"),
-        ("appid", "m_core"),
-        ("openudid", ""),
+    // 严格对齐 h5st-probe send.rs 的精简 form(10 项,验证过能下单那版):不发
+    // osVersion/screen/networkType/d_brand/d_model/lang/sdkVersion/openudid/uuid/
+    // x-api-eid-token —— 多余字段也可能被风控判异常。client 与 WS 签名同值(MacIntel)。
+    let _ = rp; // 精简版不再从 CK 取 uuid/eid 进 form
+    [
+        ("appid", "m_core".to_string()),
+        ("functionId", function_id.to_string()),
+        ("body", body_str.to_string()),
+        ("client", ORDER_CLIENT_PLATFORM.to_string()),
+        ("clientVersion", "3.0.8".to_string()),
+        ("loginType", "2".to_string()),
+        ("t", t.to_string()),
+        ("scval", youpin_id.to_string()),
+        ("xAPIScval3", "m_inter_detail_balance".to_string()),
+        ("h5st", h5st.to_string()),
     ]
     .into_iter()
-    .map(|(k, v)| (k.to_string(), v.to_string()))
-    .collect();
-    if !rp.eid_token.is_empty() {
-        p.push(("x-api-eid-token".into(), rp.eid_token.clone()));
-    }
-    p.push(("functionId".into(), function_id.to_string()));
-    p.push(("uuid".into(), rp.device_uuid.clone()));
-    p.push(("loginType".into(), "2".to_string()));
-    p.push(("t".into(), t.to_string()));
-    p.push(("scval".into(), youpin_id.to_string()));
-    p.push(("xAPIScval3".into(), "m_inter_detail_balance".to_string()));
-    p.push(("body".into(), body_str.to_string()));
-    p.push(("h5st".into(), h5st.to_string()));
-    p
+    .map(|(k, v)| (k.to_string(), v))
+    .collect()
 }
 
 /// One step: sign + POST + parse. Returns (parsed_json, body_used_for_address).
@@ -568,7 +566,16 @@ async fn order_once_inner<S: Signer, H: OrderHttp>(
     };
     let b1 = &r1["body"];
     if b1["errorCode"].as_str() == Some("601") {
-        return OrderResult { credential: cred.name.clone(), ..OrderResult::fail("601") };
+        // 保留 JD 的完整响应,便于判断 601 卡在哪层(签名层会是别的 code/msg,
+        // 风控层 601 通常 code:0/msg:success 但 body.errorCode=601)。
+        let diag = format!(
+            "601 [code={} msg={} errReason={}] resp={}",
+            r1["code"].as_str().unwrap_or(&r1["code"].to_string()),
+            r1["message"].as_str().unwrap_or(""),
+            b1["errorReason"].as_str().unwrap_or(""),
+            serde_json::to_string(&r1).unwrap_or_default().chars().take(400).collect::<String>(),
+        );
+        return OrderResult { credential: cred.name.clone(), ..OrderResult::fail(diag) };
     }
     // 地址 ID 可能是字符串或数字(真实返回是数字,如 13017040608),两种都接受。
     let addr_val = |v: &Value| -> Option<String> {
@@ -964,11 +971,11 @@ mod tests {
         );
     }
 
-    /// URL 参数对齐**成功**抓包(getCurrentOrder 返回 code:0 + 地址 + 价格)。
-    /// 环境参数(client/screen/lang)固定为成功实测环境(MacIntel/390*844/en-US),
-    /// 业务参数(d_brand/d_model/openudid 空串、loginType=2 等)精确锁死,防回归。
+    /// form 严格对齐 h5st-probe send.rs(验证过能下单那版):精简 10 项,client=MacIntel
+    /// (与 WS 签名同值,否则 seg7 自相矛盾→601),且【不含】screen/lang/osVersion/
+    /// sdkVersion/networkType/d_brand/d_model/openudid/uuid/x-api-eid-token。
     #[test]
-    fn build_params_matches_real_capture() {
+    fn build_params_matches_h5st_probe_form() {
         let rp = RealParams {
             device_uuid: "7978913553131800874".into(),
             address_id: String::new(),
@@ -977,22 +984,23 @@ mod tests {
         };
         let p = build_params("balance_getCurrentOrder_m", "{}", "100358632432", "H5ST", 1782364563948, &rp);
         let get = |k: &str| p.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
-        // 环境参数 = 成功样本环境(京东不校验具体值,固定默认)。
-        assert_eq!(get("client").as_deref(), Some("MacIntel"));
-        assert_eq!(get("screen").as_deref(), Some("390*844"));
-        assert_eq!(get("lang").as_deref(), Some("en-US"));
-        // 业务固定值。
+        // 必含的 10 项。
+        assert_eq!(get("appid").as_deref(), Some("m_core"));
+        assert_eq!(get("functionId").as_deref(), Some("balance_getCurrentOrder_m"));
+        assert_eq!(get("body").as_deref(), Some("{}"));
+        assert_eq!(get("client").as_deref(), Some("MacIntel")); // = ORDER_CLIENT_PLATFORM = WS 签名 client
         assert_eq!(get("clientVersion").as_deref(), Some("3.0.8"));
-        assert_eq!(get("sdkVersion").as_deref(), Some("3.0.8"));
-        assert_eq!(get("osVersion").as_deref(), Some("other"));
-        assert_eq!(get("networkType").as_deref(), Some("false"));
-        assert_eq!(get("d_brand").as_deref(), Some(""));
-        assert_eq!(get("d_model").as_deref(), Some(""));
-        assert_eq!(get("openudid").as_deref(), Some(""));
         assert_eq!(get("loginType").as_deref(), Some("2"));
+        assert_eq!(get("t").as_deref(), Some("1782364563948"));
         assert_eq!(get("scval").as_deref(), Some("100358632432"));
         assert_eq!(get("xAPIScval3").as_deref(), Some("m_inter_detail_balance"));
-        assert_eq!(get("x-api-eid-token").as_deref(), Some("EIDTOK"));
+        assert_eq!(get("h5st").as_deref(), Some("H5ST"));
+        assert_eq!(p.len(), 10, "form 必须正好 10 项(对齐 h5st-probe)");
+        // 确认多余字段已剔除。
+        for k in ["screen", "lang", "osVersion", "sdkVersion", "networkType",
+                  "d_brand", "d_model", "openudid", "uuid", "x-api-eid-token"] {
+            assert!(get(k).is_none(), "{k} 不应出现在 form 里");
+        }
     }
 
     /// Step1 body 对齐 h5st-probe(验证过能下单那版):resolution=390*844、

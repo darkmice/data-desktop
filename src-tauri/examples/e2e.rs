@@ -12,8 +12,8 @@
 
 use std::sync::Arc;
 
-use paipai_client_lib::core::ck::Credential;
-use paipai_client_lib::core::order::{self, ReqwestHttp, Signer};
+use paipai_client_lib::core::ck::{self, Credential};
+use paipai_client_lib::core::order::{self, WreqHttp, Signer};
 use paipai_client_lib::ws_client::{SignRecipe, WsClient, WsEvent};
 use serde_json::json;
 use tokio::sync::mpsc;
@@ -97,8 +97,8 @@ async fn main() -> anyhow::Result<()> {
     let ck = std::fs::read_to_string("/Users/dark/WebstormProjects/tauri-webview-h5st/docs/id.txt")
         .unwrap_or_default();
     if !ck.trim().is_empty() {
-        let creds = vec![Credential { name: "test".into(), cookie_str: ck.trim().to_string(), valid: true }];
-        let http = ReqwestHttp { client: reqwest::Client::builder().timeout(std::time::Duration::from_secs(10)).build()? };
+        let creds = vec![Credential { name: "test".into(), cookie_str: ck.trim().to_string(), status: ck::CredStatus::Active, valid: true }];
+        let http = WreqHttp::new();
         let mut logs = Vec::new();
         let (res, _creds, _idx) = order::order_with_rotation(
             &ws, &http, creds, 0, "121918401832968", "100221186437", now_ms, &mut logs,

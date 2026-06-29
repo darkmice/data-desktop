@@ -39,7 +39,7 @@ export function Sidebar() {
       <div className="flex items-center gap-tp-3 border-b border-border px-tp-4 py-tp-4">
         <img src={logoUrl} alt="logo" className="h-8 w-8 shrink-0 rounded-md" />
         <div className="leading-tight">
-          <div className="text-sm font-medium text-text-primary">拍拍商品数据研究助手</div>
+          <div className="text-sm font-medium text-text-primary">商品数据研究助手</div>
           <div className="text-[10px] text-text-tertiary">仅供学习交流使用</div>
         </div>
       </div>

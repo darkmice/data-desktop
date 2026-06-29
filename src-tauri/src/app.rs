@@ -16,7 +16,7 @@ use crate::core::notify::{
 };
 use crate::core::notify::channel::Subscriptions;
 use crate::core::notify::event::EventKind;
-use crate::core::order::{self, OrderResult, ReqwestHttp};
+use crate::core::order::{self, OrderResult, WreqHttp};
 use crate::core::rules::{self, Rule};
 use crate::ws_client::{WsClient, WsEvent};
 
@@ -178,7 +178,10 @@ pub struct AppState {
     pub rules: Mutex<Vec<Rule>>,
     pub active_idx: Mutex<usize>,
     pub ws: Mutex<Option<WsClient>>,
-    pub http: ReqwestHttp,
+    pub http: WreqHttp,
+    /// 通知渠道(钉钉/飞书)用的普通 HTTP 客户端。与下单的 wreq 分开:通知不需要
+    /// impersonate 浏览器,用 reqwest 即可。
+    pub notify_http: reqwest::Client,
     /// Serializes order attempts so concurrent submits (two sku_hit events, or a
     /// hit racing a manual submit) cannot interleave their read-modify-write of
     /// creds/active_idx. Held for the whole attempt.
@@ -197,12 +200,11 @@ impl AppState {
             rules: Mutex::new(Vec::new()),
             active_idx: Mutex::new(0),
             ws: Mutex::new(None),
-            http: ReqwestHttp {
-                client: reqwest::Client::builder()
-                    .timeout(std::time::Duration::from_secs(10))
-                    .build()
-                    .expect("reqwest"),
-            },
+            http: WreqHttp::new(),
+            notify_http: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(10))
+                .build()
+                .expect("reqwest"),
             order_lock: Mutex::new(()),
             history: OnceLock::new(),
         }
@@ -278,7 +280,11 @@ fn load_persisted(state: &AppState) {
         }
     }
     if let Ok(Some(s)) = store.kv_get(KV_CREDS) {
-        if let Ok(creds) = serde_json::from_str::<Vec<Credential>>(&s) {
+        if let Ok(mut creds) = serde_json::from_str::<Vec<Credential>>(&s) {
+            // 迁移旧持久化:旧数据只有 valid:bool 无 status,按 valid 推断 status。
+            for c in &mut creds {
+                c.migrate_legacy_valid();
+            }
             *state.creds.blocking_lock() = creds;
         }
     }
@@ -370,14 +376,14 @@ pub async fn import_credential(
         return Err(format!("Cookie 缺少必要字段：{}", missing.join("、")));
     }
 
-    let valid = ck::has_pt_key(&cookies);
     let count = cookies.len();
     {
         let mut creds = state.creds.lock().await;
         creds.push(Credential {
             name: if name.is_empty() { "未命名".into() } else { name },
             cookie_str,
-            valid,
+            status: ck::CredStatus::Active,
+            valid: true,
         });
     }
     persist(&state, KV_CREDS, &*state.creds.lock().await);
@@ -408,6 +414,25 @@ pub async fn delete_credential(state: State<'_, Arc<AppState>>, index: usize) ->
 #[tauri::command]
 pub async fn use_credential(state: State<'_, Arc<AppState>>, index: usize) -> Result<(), String> {
     *state.active_idx.lock().await = index;
+    Ok(())
+}
+
+/// 手动解除凭证的风控/过期状态,改回 Active,让它重新参与下单。
+/// 用于:601 风控冷却后想重试,或刚更新了同名 CK 想重置状态。
+#[tauri::command]
+pub async fn clear_credential_status(
+    state: State<'_, Arc<AppState>>,
+    index: usize,
+) -> Result<(), String> {
+    {
+        let mut creds = state.creds.lock().await;
+        if index >= creds.len() {
+            return Err("凭证不存在".into());
+        }
+        creds[index].status = ck::CredStatus::Active;
+        creds[index].valid = true;
+    }
+    persist(&state, KV_CREDS, &*state.creds.lock().await);
     Ok(())
 }
 
@@ -665,7 +690,7 @@ fn record_order(
 /// React to a matched new SKU: if auto-submit is on, run the order flow.
 async fn on_sku_hit(app: AppHandle, state: Arc<AppState>, sku: Value) {
     let cfg = state.config.lock().await.clone();
-    let notifier = build_notifier(&cfg, state.http.client.clone());
+    let notifier = build_notifier(&cfg, state.notify_http.clone());
 
     let inspect_id = sku["inspect_sku_id"].as_str().unwrap_or("").to_string();
     let youpin_id = sku["youpin_sku_id"].as_str().unwrap_or("").to_string();
@@ -863,7 +888,7 @@ pub async fn manual_submit(
     // 订阅过滤)。手动提交无商品名/成色,这些字段留空(模板会用占位/略过)。
     {
         let cfg = state.config.lock().await.clone();
-        let notifier = build_notifier(&cfg, state.http.client.clone());
+        let notifier = build_notifier(&cfg, state.notify_http.clone());
         let link = order::product_link(&youpin_id, &inspect_id);
         let outcome = OrderOutcome {
             product_name: String::new(),
@@ -969,6 +994,7 @@ pub fn run() {
             import_credential,
             delete_credential,
             use_credential,
+            clear_credential_status,
             get_rules,
             save_rules,
             reenable_rule,

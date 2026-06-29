@@ -48,8 +48,11 @@ export function Dashboard() {
   const [net, setNet] = useState<number>(-1);
   const [api, setApi] = useState<number>(-1);
 
-  const [mInspect, setMInspect] = useState('');
-  const [mYoupin, setMYoupin] = useState('');
+  // 手动下单输入值放 store(切换界面不清空,除非用户手动改/清)。
+  const mInspect = useStore((s) => s.manualInspect);
+  const mYoupin = useStore((s) => s.manualYoupin);
+  const setMInspect = useStore((s) => s.setManualInspect);
+  const setMYoupin = useStore((s) => s.setManualYoupin);
 
   const logRef = useRef<HTMLDivElement>(null);
   useEffect(() => {

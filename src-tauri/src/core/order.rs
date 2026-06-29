@@ -68,10 +68,17 @@ pub trait OrderHttp: Send + Sync {
     ) -> Result<Value, String>;
 }
 
-/// Keywords that mean "rotate to the next credential" (中性日志措辞,
-/// 不出现风控字样). Ported from Python `_is_need_rotate`.
+/// 是否应轮换到下一把凭证 = 当前凭证的【登录态失效】(CK 过期 / 未登录),
+/// 换一把有效 CK 才可能成功。
+///
+/// ⚠️【601 不在此列】601 是风控(间歇性、对频率敏感,见 paipai-h5st-sign-recipe):
+/// 同一把 CK 慢点重试可能就成。把 601 当凭证失效会把好凭证 valid=false 永久禁用,
+/// 之后再下单直接跳过该凭证(连签名都不发)——这是之前的 bug。601 的处理见
+/// order_once_inner:Step1 拿到 601 直接 fail 返回,但【不】触发轮换、不禁用凭证。
 fn needs_rotation(err: &str) -> bool {
-    const KW: &[&str] = &["601", "未登录", "登录失效", "请先登录", "invalid", "expired"];
+    // 只认明确的登录态失效信号(302=CK过期 / 未登录 / 登录失效 / 请先登录 / expired)。
+    // 不含 "601"、不含过宽的 "invalid"(601 的 errorReason 可能含 invalid 误伤)。
+    const KW: &[&str] = &["302", "未登录", "登录失效", "请先登录", "expired", "no access"];
     KW.iter().any(|k| err.contains(k))
 }
 
@@ -638,7 +645,9 @@ pub async fn order_with_rotation<S: Signer, H: OrderHttp>(
     let mut tried = 0;
 
     while tried < n {
-        if !creds[idx].valid {
+        // 只跳过【已过期】凭证(需换 CK);风控(RiskControlled)凭证仍允许重试
+        // (601 间歇性),只是前端标橙提示。这样修好了"601 后再下单连签名都不发"的 bug。
+        if creds[idx].status == ck::CredStatus::Expired {
             idx = (idx + 1) % n;
             tried += 1;
             continue;
@@ -646,15 +655,18 @@ pub async fn order_with_rotation<S: Signer, H: OrderHttp>(
         logs.push(format!("使用凭证: {}", creds[idx].name));
         let res = order_once(signer, http, &creds[idx], inspect_id, youpin_id, now_ms).await;
         if res.success {
+            // 成功 → 恢复为 Active(清掉之前可能的风控标记)。
+            creds[idx].status = ck::CredStatus::Active;
+            creds[idx].valid = true;
             return (res, creds, idx);
         }
         logs.push(format!("提交失败 ({}): {}", creds[idx].name, res.error));
         if needs_rotation(&res.error) {
-            // Mark invalid regardless of credential count, so a single failing
-            // credential is not retried in an infinite loop by the caller.
+            // 登录态失效(302/过期)→ 标记 Expired 并轮换到下一把。
+            creds[idx].status = ck::CredStatus::Expired;
             creds[idx].valid = false;
             tried += 1;
-            if n == 1 || tried >= n || !creds.iter().any(|c| c.valid) {
+            if n == 1 || tried >= n || !creds.iter().any(|c| c.is_active()) {
                 logs.push("所有凭证均不可用，请更新凭证".into());
                 return (
                     OrderResult { error: format!("所有凭证均不可用: {}", res.error), ..res },
@@ -662,11 +674,16 @@ pub async fn order_with_rotation<S: Signer, H: OrderHttp>(
                     idx,
                 );
             }
-            logs.push(format!("凭证 {} 暂不可用，自动切换", creds[idx].name));
+            logs.push(format!("凭证 {} 已失效，自动切换", creds[idx].name));
             idx = (idx + 1) % n;
             continue;
         }
-        // Non-rotation failure: stop here.
+        // 非轮换失败(风控 601 等):标记风控态(前端橙色、可手动解除/重试),停在这里。
+        // 不禁用、不轮换——同一把 CK 慢点重试可能就成。
+        if res.error.contains("601") {
+            creds[idx].status = ck::CredStatus::RiskControlled;
+            creds[idx].valid = true;
+        }
         return (res, creds, idx);
     }
     (OrderResult::fail("所有凭证均已尝试"), creds, idx)
@@ -678,35 +695,72 @@ pub fn product_link(youpin_id: &str, inspect_id: &str) -> String {
 }
 
 /// Default order HTTP impl over reqwest (used by the Tauri layer).
-pub struct ReqwestHttp {
-    pub client: reqwest::Client,
+/// 完整 iPhone Safari UA(对齐 h5st-probe send.rs:带 Version/Mobile/Safari 段,
+/// 不能用残缺串)。
+const ORDER_UA: &str = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_5 like Mac OS X) \
+AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.5 Mobile/15E148 Safari/604.1";
+
+/// 下单 HTTP 客户端 —— 用 wreq(impersonate Chrome)伪造 TLS/JA3/HTTP2 指纹。
+/// JD 风控在传输层识别非浏览器客户端,普通 reqwest 的 TLS 指纹必被判 601;wreq 对齐
+/// 真实 Chrome,这是 h5st-probe 能成功下单的关键。逐项照搬 h5st-probe send.rs。
+pub struct WreqHttp {
+    pub client: wreq::Client,
+}
+
+impl WreqHttp {
+    /// 构建 impersonate Chrome 的 wreq 客户端(失败兜底为默认 client)。
+    pub fn new() -> Self {
+        let client = wreq::Client::builder()
+            .emulation(wreq_util::Emulation::Chrome131)
+            .build()
+            .unwrap_or_default();
+        WreqHttp { client }
+    }
+}
+
+impl Default for WreqHttp {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[async_trait::async_trait]
-impl OrderHttp for ReqwestHttp {
+impl OrderHttp for WreqHttp {
     async fn post_client_action(
         &self,
         params: &[(String, String)],
         cookie_header: &str,
         youpin_id: &str,
     ) -> Result<Value, String> {
+        use wreq::header::{HeaderMap, HeaderName, HeaderValue};
         let referer = format!("https://item.m.jd.com/product/{youpin_id}.html");
         let form: Vec<(String, String)> = params.to_vec();
+
+        // header 严格对齐 h5st-probe send.rs(能下单那版)。
+        let mut headers = HeaderMap::new();
+        let set = |h: &mut HeaderMap, k: &'static str, v: &str| {
+            if let Ok(val) = HeaderValue::from_str(v) {
+                h.insert(HeaderName::from_static(k), val);
+            }
+        };
+        set(&mut headers, "content-type", "application/x-www-form-urlencoded");
+        set(&mut headers, "origin", "https://item.m.jd.com");
+        set(&mut headers, "user-agent", ORDER_UA);
+        set(&mut headers, "referer", &referer);
+        set(&mut headers, "x-referer-page", &referer);
+        set(&mut headers, "x-rp-client", "h5_2.1.0");
+        set(&mut headers, "cookie", cookie_header);
+
         let resp = self
             .client
             .post(ORDER_URL)
-            .header("Content-Type", "application/x-www-form-urlencoded")
-            .header("Referer", &referer)
-            .header("x-referer-page", &referer)
-            .header("x-rp-client", "h5_2.1.0")
-            .header("Origin", "https://item.m.jd.com")
-            .header("User-Agent", "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15")
-            .header("Cookie", cookie_header)
+            .headers(headers)
             .form(&form)
             .send()
             .await
             .map_err(|e| e.to_string())?;
-        resp.json::<Value>().await.map_err(|e| e.to_string())
+        let text = resp.text().await.map_err(|e| e.to_string())?;
+        serde_json::from_str::<Value>(&text).map_err(|e| e.to_string())
     }
 }
 
@@ -746,7 +800,12 @@ mod tests {
     }
 
     fn creds(names: &[&str]) -> Vec<Credential> {
-        names.iter().map(|n| Credential { name: n.to_string(), cookie_str: "pt_key=x; visitkey=v".into(), valid: true }).collect()
+        names.iter().map(|n| Credential {
+            name: n.to_string(),
+            cookie_str: "pt_key=x; visitkey=v".into(),
+            status: ck::CredStatus::Active,
+            valid: true,
+        }).collect()
     }
 
     /// 一个贴近真实的 Step1 `body` 返回(含会话凭据 + SKU 详情 + 地址)。
@@ -858,16 +917,43 @@ mod tests {
         assert_eq!(r.order_id, "ORDER123");
     }
 
+    /// 601 = 风控(间歇性),不是凭证失效:必须【不轮换、不禁用凭证】,失败返回但
+    /// 凭证保持 valid,这样用户可以用同一把 CK 慢点重试。回归防护:之前的 bug 是
+    /// 601 触发 needs_rotation → valid=false → 之后下单跳过该凭证(连签名都不发)。
     #[tokio::test]
-    async fn rotation_on_601_exhausts_then_fails() {
+    async fn risk_601_does_not_disable_credential() {
         let mut logs = Vec::new();
         let (r, updated, _) = order_with_rotation(
             &FakeSigner, &RiskHttp, creds(&["a", "b"]), 0, "i1", "y1", 1000,
             &mut logs,
         ).await;
         assert!(!r.success);
-        assert!(updated.iter().all(|c| !c.valid), "both creds marked invalid");
-        assert!(logs.iter().any(|l| l.contains("自动切换")));
+        assert!(r.error.contains("601"));
+        // 关键:命中的凭证标为风控态(前端橙色)但仍可用(is_active 仅 Expired 才 false),
+        // 不发生轮换切换。第一把(idx 0)被标 RiskControlled,但 status!=Expired → 下次仍会用。
+        assert_eq!(updated[0].status, ck::CredStatus::RiskControlled, "601 标风控态");
+        assert!(updated.iter().all(|c| c.status != ck::CredStatus::Expired), "601 不应标过期");
+        assert!(!logs.iter().any(|l| l.contains("自动切换")), "601 不应触发轮换");
+    }
+
+    /// 真正的登录态失效(302/未登录)才轮换:第一把失效后切到下一把。
+    #[tokio::test]
+    async fn expired_ck_rotates_to_next_credential() {
+        struct ExpiredHttp;
+        #[async_trait::async_trait]
+        impl OrderHttp for ExpiredHttp {
+            async fn post_client_action(&self, _p: &[(String, String)], _c: &str, _y: &str) -> Result<Value, String> {
+                Ok(json!({"body":{"errorCode":"302","errorReason":"no access"}}))
+            }
+        }
+        let mut logs = Vec::new();
+        let (r, updated, _) = order_with_rotation(
+            &FakeSigner, &ExpiredHttp, creds(&["a", "b"]), 0, "i1", "y1", 1000,
+            &mut logs,
+        ).await;
+        assert!(!r.success);
+        // 两把都 302 → 都标 Expired → 最终"所有凭证均不可用"。
+        assert!(updated.iter().all(|c| c.status == ck::CredStatus::Expired), "302 应标过期");
     }
 
     #[test]

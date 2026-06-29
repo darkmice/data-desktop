@@ -50,6 +50,17 @@ export function Credentials() {
     await refresh();
   }
 
+  // 手动解除风控/过期状态 → 改回 Active,可重新参与下单。
+  async function clearStatus(i: number) {
+    try {
+      await invoke('clear_credential_status', { index: i });
+      notify('已解除状态,凭证恢复可用');
+      await refresh();
+    } catch (e) {
+      notify(`解除失败: ${String(e)}`, 'err');
+    }
+  }
+
   return (
     <div className="mx-auto flex max-w-3xl flex-col gap-tp-5">
       <h1 className="text-2xl font-semibold text-text-primary">凭证管理</h1>
@@ -92,9 +103,29 @@ export function Credentials() {
               <span className="flex-1 truncate text-sm text-text-primary" title={c.name || '未命名'}>
                 {c.name || '未命名'}
               </span>
-              <Tag tone={c.valid ? 'done' : 'blocked'} size="sm">
-                {c.valid ? '可用' : '已失效'}
-              </Tag>
+              {(() => {
+                // 状态标签(不同色):可用=绿,风控=橙(可重试),过期=红(需换CK)。
+                const status = c.status ?? (c.valid === false ? 'Expired' : 'Active');
+                if (status === 'RiskControlled') {
+                  // progress = 橙/黄色调:风控冷却中,可手动解除后重试。
+                  return <Tag tone="progress" size="sm">风控</Tag>;
+                }
+                if (status === 'Expired') {
+                  return <Tag tone="blocked" size="sm">已过期</Tag>;
+                }
+                return <Tag tone="done" size="sm">可用</Tag>;
+              })()}
+              {(c.status ?? 'Active') !== 'Active' && (
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="shrink-0 whitespace-nowrap"
+                  onClick={() => clearStatus(i)}
+                  title="解除风控/过期状态,恢复可用"
+                >
+                  解除
+                </Button>
+              )}
               {i === activeIdx ? (
                 <Tag tone="info" size="sm">
                   当前

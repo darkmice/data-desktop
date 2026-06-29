@@ -35,6 +35,10 @@ interface AppStore {
   serverParams: WatchParams;
   logs: LogLine[];
   stats: OrderStats;
+  /** 手动下单输入框的值。放 store(而非组件 useState)是为了切换界面后不清空,
+   *  除非用户手动改/清。 */
+  manualInspect: string;
+  manualYoupin: string;
 
   // setters
   setConn: (c: ConnStatus, reason?: string) => void;
@@ -50,6 +54,8 @@ interface AppStore {
   setStats: (s: OrderStats) => void;
   pushLog: (msg: string, kind?: LogLine['kind']) => void;
   clearLogs: () => void;
+  setManualInspect: (v: string) => void;
+  setManualYoupin: (v: string) => void;
 }
 
 export const useStore = create<AppStore>((set) => ({
@@ -65,6 +71,8 @@ export const useStore = create<AppStore>((set) => ({
   serverParams: DEFAULT_PARAMS,
   logs: [],
   stats: { total: 0, success: 0, failed: 0 },
+  manualInspect: '',
+  manualYoupin: '',
 
   setConn: (conn, reason = '') =>
     set((s) => ({
@@ -97,6 +105,8 @@ export const useStore = create<AppStore>((set) => ({
       return { logs };
     }),
   clearLogs: () => set({ logs: [] }),
+  setManualInspect: (manualInspect) => set({ manualInspect }),
+  setManualYoupin: (manualYoupin) => set({ manualYoupin }),
 }));
 
 /** 应用主题到 <html data-theme>。dark 命中 dark 选择器,其余走默认(light)。 */

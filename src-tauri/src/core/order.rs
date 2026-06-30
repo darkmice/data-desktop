@@ -729,9 +729,7 @@ pub async fn order_with_rotation_probe<S: Signer>(
             tried += 1;
             continue;
         }
-        logs.push(format!("使用凭证: {}", creds[idx].name));
-
-        let res = order_once_probe(signer, &creds[idx], inspect_id, youpin_id, logs).await;
+        let res = order_once_probe(signer, &creds[idx], inspect_id, youpin_id).await;
 
         if res.success {
             creds[idx].status = ck::CredStatus::Active;
@@ -768,7 +766,6 @@ async fn order_once_probe<S: Signer>(
     cred: &Credential,
     inspect_id: &str,
     youpin_id: &str,
-    logs: &mut Vec<String>,
 ) -> OrderResult {
     use h5st_probe::{body as pbody, send as psend};
 
@@ -787,7 +784,6 @@ async fn order_once_probe<S: Signer>(
         Ok(r) => r,
         Err(e) => return OrderResult { credential: cred.name.clone(), ..OrderResult::fail(format!("Step1 发请求失败: {e}")) },
     };
-    logs.push(format!("[{}] step1: http={} code={} seg3={}", cred.name, r1.http_status, r1.code, signed1.seg3));
     if !r1.is_ok() {
         let msg = if r1.error_reason.is_empty() {
             format!("Step1 未成功: code={} {}", r1.code, r1.raw_snippet)
@@ -817,7 +813,6 @@ async fn order_once_probe<S: Signer>(
     }
 
     let order_id = order_id_of_probe(&r2);
-    logs.push(format!("[{}] step2: http={} code={}", cred.name, r2.http_status, r2.code));
     if r2.code == "0" && !order_id.is_empty() && order_id != "null" {
         let op = r2.body()["order"]["orderPrice"].to_string();
         OrderResult {

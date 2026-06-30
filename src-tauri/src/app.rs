@@ -347,12 +347,9 @@ pub async fn get_config(state: State<'_, Arc<AppState>>) -> Result<AppConfig, St
 
 #[tauri::command]
 pub async fn save_config(state: State<'_, Arc<AppState>>, config: AppConfig) -> Result<(), String> {
-    let recipe = crate::ws_client::SignRecipe::from_str(&config.sign_recipe);
+    // 签名只有一套(= h5st-probe codex 模式),不再有 recipe 切换。sign_recipe 字段
+    // 保留仅为兼容旧持久化/前端类型,不再影响签名行为。
     *state.config.lock().await = config.clone();
-    // If already connected, apply the recipe live (no reconnect needed).
-    if let Some(ws) = state.ws.lock().await.as_ref() {
-        ws.set_recipe(recipe);
-    }
     persist(&state, KV_CONFIG, &config);
     Ok(())
 }
@@ -506,10 +503,9 @@ pub async fn connect(app: AppHandle, state: State<'_, Arc<AppState>>) -> Result<
     };
 
     let (ev_tx, mut ev_rx) = mpsc::unbounded_channel::<WsEvent>();
-    let recipe = crate::ws_client::SignRecipe::from_str(&cfg.sign_recipe);
     // wss + 后端 https 无证书:insecure 恒 true(复用 ws_client 的 NoVerify 验证器)。
     // url 连不通 → 提示联系管理员更新 Token(而非暴露底层网络错误)。
-    let ws = match WsClient::connect(&resolved_url, &resolved_tok, true, recipe, master_key(), ev_tx).await {
+    let ws = match WsClient::connect(&resolved_url, &resolved_tok, true, master_key(), ev_tx).await {
         Ok(ws) => ws,
         Err(e) => {
             tracing::warn!(error = %e, "WS 连接失败");

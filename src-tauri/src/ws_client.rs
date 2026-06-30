@@ -45,25 +45,6 @@ pub enum WsEvent {
     Kicked { code: String, message: String },
 }
 
-/// Signing recipe selected in the UI. `Paipai` = paipai_h5 → seg3=rdv6s with a
-/// raw (un-hashed) body. `Codex` = leave sign_app_id empty so the server's
-/// per-functionId table maps it (balance_getCurrentOrder_m→bd265,
-/// balance_submitOrder_m→cc85b) with a sha256 body.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SignRecipe {
-    Paipai,
-    Codex,
-}
-
-impl SignRecipe {
-    pub fn from_str(s: &str) -> Self {
-        match s {
-            "codex" | "bd265" => SignRecipe::Codex,
-            _ => SignRecipe::Paipai,
-        }
-    }
-}
-
 /// Handle to the live WS connection. Cloneable; sending is via an mpsc to the
 /// writer task.
 #[derive(Clone)]
@@ -71,7 +52,6 @@ pub struct WsClient {
     out_tx: mpsc::UnboundedSender<Message>,
     pending: Arc<Mutex<HashMap<String, oneshot::Sender<Result<String, String>>>>>,
     sign_seq: Arc<std::sync::atomic::AtomicU64>,
-    recipe: Arc<std::sync::atomic::AtomicU8>, // 0=Paipai, 1=Codex
     /// Master key for WS frame encryption (every business frame is AES-GCM
     /// encrypted to a binary frame; plaintext is rejected by the server).
     key: Arc<[u8; 32]>,
@@ -84,7 +64,6 @@ impl WsClient {
         wss_url: &str,
         token: &str,
         insecure: bool,
-        recipe: SignRecipe,
         key: [u8; 32],
         events: mpsc::UnboundedSender<WsEvent>,
     ) -> Result<Self, String> {
@@ -203,31 +182,8 @@ impl WsClient {
             out_tx,
             pending,
             sign_seq: Arc::new(std::sync::atomic::AtomicU64::new(1)),
-            recipe: Arc::new(std::sync::atomic::AtomicU8::new(match recipe {
-                SignRecipe::Paipai => 0,
-                SignRecipe::Codex => 1,
-            })),
             key: key_arc,
         })
-    }
-
-    /// Switch the signing recipe for subsequent sign() calls (live, no reconnect).
-    pub fn set_recipe(&self, recipe: SignRecipe) {
-        self.recipe.store(
-            match recipe {
-                SignRecipe::Paipai => 0,
-                SignRecipe::Codex => 1,
-            },
-            std::sync::atomic::Ordering::Relaxed,
-        );
-    }
-
-    fn current_recipe(&self) -> SignRecipe {
-        if self.recipe.load(std::sync::atomic::Ordering::Relaxed) == 1 {
-            SignRecipe::Codex
-        } else {
-            SignRecipe::Paipai
-        }
     }
 
     fn send(&self, v: Value) -> Result<(), String> {
@@ -290,16 +246,10 @@ impl Signer for WsClient {
         let (tx, rx) = oneshot::channel();
         self.pending.lock().await.insert(id.clone(), tx);
 
-        // Recipe selects the signature variant + body hashing:
-        //   Paipai → sign_app_id=paipai_h5 (seg3=rdv6s), raw body.
-        //   Codex  → sign_app_id="" so the server maps by functionId
-        //            (getCurrentOrder→bd265, submitOrder→cc85b), sha256 body.
-        // `t` is passed so the h5st inner t equals the outer request t.
-        // On send failure, remove the pending entry so it does not leak.
-        let (sign_app_id, raw_body) = match self.current_recipe() {
-            SignRecipe::Paipai => ("paipai_h5", true),
-            SignRecipe::Codex => ("", false),
-        };
+        // 唯一一套签名 = 测试工具(h5st-probe)那套:sign_app_id 留空,服务端按
+        // functionId 映射(getCurrentOrder→bd265 / submitOrder→cc85b),body 走 sha256
+        // (raw_body=false)。曾经的第二套 paipai_h5(rdv6s/raw body)已废弃删除——
+        // 服务端也强制规范化为这套,前端固定 codex。`t` 传入使 h5st 内层 t = 外层请求 t。
         if let Err(e) = self.send(json!({
             "type": "sign",
             "id": id,
@@ -314,8 +264,8 @@ impl Signer for WsClient {
             // 这是客户端一直 601 的真因(h5st-probe 全链 MacIntel 一致才成功)。
             // 与 order::build_params 的 ("client","MacIntel") 必须保持同值。
             "client": ORDER_CLIENT_PLATFORM,
-            "sign_app_id": sign_app_id,
-            "raw_body": raw_body,
+            "sign_app_id": "",
+            "raw_body": false,
             "t": t,
         })) {
             self.pending.lock().await.remove(&id);

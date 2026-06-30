@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use paipai_client_lib::core::ck::{self, Credential};
 use paipai_client_lib::core::order::{self, WreqHttp, Signer};
-use paipai_client_lib::ws_client::{SignRecipe, WsClient, WsEvent};
+use paipai_client_lib::ws_client::{WsClient, WsEvent};
 use serde_json::json;
 use tokio::sync::mpsc;
 
@@ -36,7 +36,7 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let (ev_tx, mut ev_rx) = mpsc::unbounded_channel::<WsEvent>();
-    let ws = WsClient::connect(&url, &token, true, SignRecipe::Paipai, key, ev_tx)
+    let ws = WsClient::connect(&url, &token, true, key, ev_tx)
         .await
         .map_err(|e| anyhow::anyhow!("connect failed: {e}"))?;
     println!("[1] connected");

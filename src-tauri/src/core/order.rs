@@ -124,11 +124,14 @@ fn build_body(
     })
 }
 
-/// 从 Step1 的 `balanceVendorBundleList` 提取真实 SKU 详情,构建 submitOrder 所需的
-/// `balanceDataServerSkuVOList`。**用 Step1 返回的真实 skuId / jdPrice / 三级类目**,
-/// 而不是占位 0(占位会被风控标记)。Step1 结构层级:
-/// vendor → bundleList → productionList → balanceSkuList。
-fn build_sku_vo_list(b1: &Value) -> Vec<Value> {
+/// 从 Step1 的 `balanceVendorBundleList` 提取 SKU 详情,构建 submitOrder 所需的
+/// `balanceDataServerSkuVOList`。jdPrice / 三级类目 / buyNum 取 Step1 真实值,但
+/// **`id` 用 youpin_id(入参商品),逐字段对齐 h5st-probe body.rs:116**——
+/// probe 实测能下单的版本就是用 youpin 当 id(不是 Step1 的 balanceSkuList.skuId)。
+/// 二者不一致会被 JD 风控判异常(表现为"提交过快")。
+/// Step1 结构层级:vendor → bundleList → productionList → balanceSkuList。
+fn build_sku_vo_list(b1: &Value, youpin_id: &str) -> Vec<Value> {
+    let youpin = youpin_id.parse::<i64>().unwrap_or(0);
     let mut out = Vec::new();
     let venders = b1["balanceVendorBundleList"].as_array();
     let Some(venders) = venders else {
@@ -162,8 +165,9 @@ fn build_sku_vo_list(b1: &Value) -> Vec<Value> {
                         _ => "0".to_string(),
                     };
                     let buy_num = sku["num"].as_i64().unwrap_or(1);
+                    let _ = sku_id; // probe 用 youpin 当 id,不用 Step1 的 skuId
                     out.push(json!({
-                        "id": sku_id,
+                        "id": youpin,
                         "jdPrice": jd_price,
                         "buyNum": buy_num,
                         "firstCategoryId": cat_at(0),
@@ -334,7 +338,7 @@ fn build_submit_body(
     };
 
     let sku_vo_list = {
-        let v = build_sku_vo_list(b1);
+        let v = build_sku_vo_list(b1, youpin_id);
         if v.is_empty() {
             vec![json!({})]
         } else {
@@ -863,13 +867,23 @@ mod tests {
         // 精确 locationId = 省-市-区-地址ID(来自 Step1 balanceAddress)。
         assert_eq!(body["locationId"], "20-1753-1754-13017040608");
 
-        // skuVOList 用 Step1 真实 skuId + 三级类目(不是占位 0)。
+        // skuVOList:id 用 youpin_id(对齐 h5st-probe body.rs:116,不是 Step1 的
+        // balanceSkuList.skuId);jdPrice / 三级类目仍取 Step1 真实值。
         let sku = &body["balanceDataServerSkuVOList"][0];
-        assert_eq!(sku["id"], 100358632432i64);
+        assert_eq!(sku["id"], 100264461867i64); // = youpin_id,不是 Step1 skuId 100358632432
         assert_eq!(sku["jdPrice"], "1087.02");
         assert_eq!(sku["firstCategoryId"], 13765);
         assert_eq!(sku["secondCategoryId"], 13769);
         assert_eq!(sku["thirdCategoryId"], 13771);
+
+        // 顶层键顺序必须是「插入序」(serde_json preserve_order),而非字母序——
+        // JD 风控看 body 字段顺序特征。第一个 key 必须是 deviceUUID,不是 actualPayment。
+        let serialized = serde_json::to_string(&body).unwrap();
+        assert!(
+            serialized.starts_with("{\"deviceUUID\":"),
+            "body 顶层首字段应为 deviceUUID(插入序),实际: {}",
+            &serialized[..serialized.len().min(40)]
+        );
 
         // 关键固定字段。
         assert_eq!(body["appVersion"], "3.0.8");

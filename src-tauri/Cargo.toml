@@ -14,7 +14,9 @@ path = "src/main.rs"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# preserve_order:body 必须按插入顺序序列化(对齐 h5st-probe)。JD 风控会看 body
+# 的字段顺序特征,默认的字母排序 body 会被判异常(表现为下单"提交过快")。
+serde_json = { version = "1", features = ["preserve_order"] }
 tokio = { version = "1", features = ["full"] }
 async-trait = "0.1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

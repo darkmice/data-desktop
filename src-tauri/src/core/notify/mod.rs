@@ -25,6 +25,15 @@ pub use template::{render, RenderedMessage};
 
 use std::sync::Arc;
 
+/// 当前 unix 毫秒(渲染「时间」行用)。取不到时回退 0(模板会渲染成纪元时间)。
+fn now_ms() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
 /// 通知分发器:持有一组已启用渠道,把一个事件渲染后扇出给全部渠道。
 ///
 /// 渠道按配置构建(见 [`Notifier::from_channels`]);构建时已过滤掉「未启用 / 未配
@@ -54,7 +63,7 @@ impl Notifier {
         if !self.has_subscriber(&event) {
             return;
         }
-        let msg = render(&event);
+        let msg = render(&event, now_ms());
         let kind = event.kind();
         for ch in self.channels.iter() {
             if !ch.subscribes(kind) {

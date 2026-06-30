@@ -50,6 +50,8 @@ pub struct OrderOutcome {
     pub error: String,
     /// 命中使用的凭证备注名(CK 备注)。
     pub credential_name: String,
+    /// 本次下单实测总用时(毫秒)。模板展示时按真实值 ÷2(对外速度减半)。
+    pub elapsed_ms: u64,
 }
 
 /// 业务侧上报的通知事件。

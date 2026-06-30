@@ -36,7 +36,8 @@ interface AppStore {
   logs: LogLine[];
   stats: OrderStats;
   /** 手动下单输入框的值。放 store(而非组件 useState)是为了切换界面后不清空,
-   *  除非用户手动改/清。 */
+   *  除非用户手动改/清。`manualUrl` 是粘贴的商品链接(解析出 youpin/inspect)。 */
+  manualUrl: string;
   manualInspect: string;
   manualYoupin: string;
 
@@ -54,6 +55,7 @@ interface AppStore {
   setStats: (s: OrderStats) => void;
   pushLog: (msg: string, kind?: LogLine['kind']) => void;
   clearLogs: () => void;
+  setManualUrl: (v: string) => void;
   setManualInspect: (v: string) => void;
   setManualYoupin: (v: string) => void;
 }
@@ -71,6 +73,7 @@ export const useStore = create<AppStore>((set) => ({
   serverParams: DEFAULT_PARAMS,
   logs: [],
   stats: { total: 0, success: 0, failed: 0 },
+  manualUrl: '',
   manualInspect: '',
   manualYoupin: '',
 
@@ -105,6 +108,7 @@ export const useStore = create<AppStore>((set) => ({
       return { logs };
     }),
   clearLogs: () => set({ logs: [] }),
+  setManualUrl: (manualUrl) => set({ manualUrl }),
   setManualInspect: (manualInspect) => set({ manualInspect }),
   setManualYoupin: (manualYoupin) => set({ manualYoupin }),
 }));

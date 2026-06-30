@@ -99,7 +99,11 @@ impl Channel for DingTalkChannel {
     }
     async fn send(&self, client: &reqwest::Client, msg: &RenderedMessage) -> anyhow::Result<()> {
         let url = self.signed_url(now_ms());
-        let body = json!({ "msgtype": "text", "text": { "content": msg.to_plain_text() } });
+        // 钉钉用 markdown:title 作通知摘要标题,text 是 markdown 正文(对齐文档)。
+        let body = json!({
+            "msgtype": "markdown",
+            "markdown": { "title": msg.title, "text": msg.to_markdown() },
+        });
         let resp = client.post(&url).json(&body).send().await?;
         let status = resp.status();
         if !status.is_success() {

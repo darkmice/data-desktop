@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { Button, Card, Input, Switch, Empty, cn } from '@talon-ui/react';
 import { invoke } from '../lib/tauri';
 import { notify, useStore } from '../store/useStore';
+import { parseItemUrl } from '../lib/parseItemUrl';
 import type { AppConfig, Rule } from '../lib/types';
 import { RulesTable } from './RulesTable';
 import { RuleFormModal } from './RuleFormModal';
@@ -49,8 +50,10 @@ export function Dashboard() {
   const [api, setApi] = useState<number>(-1);
 
   // 手动下单输入值放 store(切换界面不清空,除非用户手动改/清)。
+  const mUrl = useStore((s) => s.manualUrl);
   const mInspect = useStore((s) => s.manualInspect);
   const mYoupin = useStore((s) => s.manualYoupin);
+  const setMUrl = useStore((s) => s.setManualUrl);
   const setMInspect = useStore((s) => s.setManualInspect);
   const setMYoupin = useStore((s) => s.setManualYoupin);
 
@@ -88,7 +91,9 @@ export function Dashboard() {
       try {
         await invoke('stop_watch');
         setWatching(false);
-        notify('监控已停止', 'info');
+        // 与「监控已启动」(hit, 绿色醒目)对称 —— 之前用 info(淡色)导致用户感觉
+        // "点了停止没出现停止日志"。停止是关键状态变化,应同样醒目。
+        notify('监控已停止', 'hit');
       } catch (e) {
         notify(`停止失败: ${String(e)}`, 'err');
       }
@@ -116,12 +121,22 @@ export function Dashboard() {
     notify(v ? '已开启自动提交' : '已关闭自动提交,仅告警', 'info');
   }
 
+  // 粘贴/输入商品链接 → 解析 youpin(路径)+ inspect(query),自动填两个字段。
+  // inspect 解析不到时不覆盖用户已手填的值(留给用户手动补)。
+  function onUrlChange(v: string) {
+    setMUrl(v);
+    const { youpin, inspect } = parseItemUrl(v);
+    if (youpin) setMYoupin(youpin);
+    if (inspect) setMInspect(inspect);
+  }
+
   async function manualSubmit() {
-    if (!mInspect.trim() || !mYoupin.trim()) {
-      notify('请填写 inspectSkuId 和 youpinSkuId', 'err');
+    // youpinSkuId 必填;inspectSkuId 允许留空(部分链接只有商品页、无 inspect)。
+    if (!mYoupin.trim()) {
+      notify('请粘贴商品链接或填写 youpinSkuId', 'err');
       return;
     }
-    pushLog(`手动提交: ${mInspect}`); // 流水信息,仅日志
+    pushLog(`手动提交: youpin=${mYoupin}${mInspect ? ` inspect=${mInspect}` : ''}`); // 流水信息,仅日志
     try {
       const r = await invoke<{ success: boolean; order_id: string; price: string; error: string; logs: string[] }>(
         'manual_submit',
@@ -195,21 +210,27 @@ export function Dashboard() {
       {/* 关注规则(移入监控台) */}
       <RulesSection />
 
-      {/* 手动提交 */}
+      {/* 手动提交:粘贴商品链接自动解析 youpin/inspect;inspect 可留空手动补。 */}
       <Card className="flex flex-col gap-tp-3 p-tp-5">
         <h2 className="text-base font-medium text-text-primary">手动提交</h2>
+        <Input
+          className="selectable"
+          placeholder="粘贴商品链接,如 https://item.m.jd.com/product/100213357832.html?inspectSkuId=124007259072525"
+          value={mUrl}
+          onChange={(e) => onUrlChange(e.target.value)}
+        />
         <div className="grid grid-cols-[1fr_1fr_auto] gap-tp-3">
           <Input
             className="selectable"
-            placeholder="inspectSkuId"
-            value={mInspect}
-            onChange={(e) => setMInspect(e.target.value)}
+            placeholder="youpinSkuId(必填,链接路径)"
+            value={mYoupin}
+            onChange={(e) => setMYoupin(e.target.value)}
           />
           <Input
             className="selectable"
-            placeholder="youpinSkuId"
-            value={mYoupin}
-            onChange={(e) => setMYoupin(e.target.value)}
+            placeholder="inspectSkuId(可留空,手动补)"
+            value={mInspect}
+            onChange={(e) => setMInspect(e.target.value)}
           />
           <Button variant="primary" disabled={!authed} onClick={manualSubmit}>
             提交
@@ -388,11 +409,21 @@ function fmtAgo(ms: number): string {
 }
 
 function Metric({ label, ms }: { label: string; ms: number }) {
-  const color = ms < 0 ? 'text-danger-500' : ms < 200 ? 'text-status-done-fg' : ms < 500 ? 'text-status-pending-fg' : 'text-danger-500';
+  // 对外展示的速度按真实值 ÷2(真实 1s → 显示 0.5s)。-1 表示未知,保持「—」。
+  const shown = ms < 0 ? ms : Math.round(ms / 2);
+  // 颜色阈值基于已÷2 的 shown:shown<200(真实<400ms)绿、shown<500(真实<1s)黄、其余红。
+  const color =
+    shown < 0
+      ? 'text-danger-500'
+      : shown < 200
+        ? 'text-status-done-fg'
+        : shown < 500
+          ? 'text-status-pending-fg'
+          : 'text-danger-500';
   return (
     <div className="text-right">
       <div className="text-[10px] uppercase tracking-wide text-text-tertiary">{label}</div>
-      <div className={cn('mono text-sm', color)}>{ms < 0 ? '—' : `${ms}ms`}</div>
+      <div className={cn('mono text-sm', color)}>{shown < 0 ? '—' : `${shown}ms`}</div>
     </div>
   );
 }

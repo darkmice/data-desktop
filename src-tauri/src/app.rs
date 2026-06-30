@@ -735,10 +735,12 @@ async fn on_sku_hit(app: AppHandle, state: Arc<AppState>, sku: Value) {
     let active = *state.active_idx.lock().await;
 
     let mut logs: Vec<String> = Vec::new();
+    let order_start = std::time::Instant::now();
     let (result, updated, new_active) = order::order_with_rotation_probe(
         &ws, creds, active, &inspect_id, &youpin_id, &mut logs,
     )
     .await;
+    let elapsed_ms = order_start.elapsed().as_millis() as u64;
     for m in logs {
         emit(&app, "log", json!({"msg": m}));
     }
@@ -780,6 +782,7 @@ async fn on_sku_hit(app: AppHandle, state: Arc<AppState>, sku: Value) {
                 order_id: result.order_id.clone(),
                 error: String::new(),
                 credential_name: result.credential.clone(),
+                elapsed_ms,
             }))
             .await;
         // 规则因达配额自动停止 → 关键状态变化,另推一条运维提醒。
@@ -806,6 +809,7 @@ async fn on_sku_hit(app: AppHandle, state: Arc<AppState>, sku: Value) {
                 order_id: String::new(),
                 error: result.error.clone(),
                 credential_name: result.credential.clone(),
+                elapsed_ms,
             }))
             .await;
     }
@@ -864,10 +868,12 @@ pub async fn manual_submit(
     let creds = state.creds.lock().await.clone();
     let active = *state.active_idx.lock().await;
     let mut logs = Vec::new();
+    let order_start = std::time::Instant::now();
     let (result, updated, new_active) = order::order_with_rotation_probe(
         &ws, creds, active, &inspect_id, &youpin_id, &mut logs,
     )
     .await;
+    let elapsed_ms = order_start.elapsed().as_millis() as u64;
     {
         let len = updated.len();
         *state.creds.lock().await = updated;
@@ -897,6 +903,7 @@ pub async fn manual_submit(
             order_id: result.order_id.clone(),
             error: result.error.clone(),
             credential_name: result.credential.clone(),
+            elapsed_ms,
         };
         let event = if result.success {
             NotifyEvent::OrderSuccess(outcome)

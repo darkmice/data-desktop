@@ -100,7 +100,7 @@ export function Orders() {
 
       {/* 表格 */}
       <Card className="p-tp-2">
-        <OrderTable items={items} />
+        <OrderTable items={items} pageBase={(page - 1) * PAGE_SIZE} />
       </Card>
 
       {/* 分页 */}

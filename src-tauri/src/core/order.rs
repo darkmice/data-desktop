@@ -700,13 +700,13 @@ pub async fn order_with_rotation<S: Signer, H: OrderHttp>(
     (OrderResult::fail("所有凭证均已尝试"), creds, idx)
 }
 
-/// 下单(probe 库版):直接复用 h5st-probe 验证过能下单的整套(本地 headless 签名 +
-/// 造 body + wreq 发),多 CK 轮换/状态机与 [`order_with_rotation`] 一致。
-///
-/// 与旧版的区别:签名不走 WS 服务端,而是 client 本地开一个 headless Chrome 签名会话
-/// (= probe 的 SignSession),Step1/Step2 共用同一会话(同一 __jda)。整个轮换共用
-/// 一个会话(像 probe 一台浏览器)。需要运行机器装有 Chrome。
-pub async fn order_with_rotation_probe(
+/// 下单(probe 库版):**body 构造 + 发请求**用 h5st-probe 验证过的同一份代码
+/// ([`h5st_probe::body`] / [`h5st_probe::send`]),**签名走 WS 服务端**(`signer`,
+/// 服务端已是 probe 裸签 tk06)。这样三块来源都对:body=probe、签名=服务端probe、
+/// 发送=probe。不在客户端本地起 Chrome 签名(无需用户装 Chrome)。
+/// 多 CK 轮换/状态机与 [`order_with_rotation`] 一致。
+pub async fn order_with_rotation_probe<S: Signer>(
+    signer: &S,
     mut creds: Vec<Credential>,
     active_idx: usize,
     inspect_id: &str,
@@ -716,16 +716,6 @@ pub async fn order_with_rotation_probe(
     if creds.is_empty() {
         return (OrderResult::fail("没有可用凭证"), creds, 0);
     }
-
-    // 开一个本地 headless 签名会话(无CK,JD 自动 __jda),整个轮换共用。
-    let session = match h5st_probe::sign::SignSession::open().await {
-        Ok(s) => s,
-        Err(e) => {
-            logs.push(format!("打开本地签名会话失败(是否装了 Chrome?): {e}"));
-            return (OrderResult::fail(format!("签名会话失败: {e}")), creds, active_idx);
-        }
-    };
-
     let n = creds.len();
     let mut idx = active_idx.min(n - 1);
     let mut tried = 0;
@@ -741,39 +731,7 @@ pub async fn order_with_rotation_probe(
         }
         logs.push(format!("使用凭证: {}", creds[idx].name));
 
-        let place = h5st_probe::order::place_order(
-            &session,
-            &creds[idx].cookie_str,
-            youpin_id,
-            inspect_id,
-            true, // 真提交
-        )
-        .await;
-
-        let res: OrderResult = match place {
-            Ok(p) => {
-                logs.push(format!("[{}] {}", creds[idx].name, p.diag));
-                if p.success {
-                    OrderResult {
-                        success: true,
-                        order_id: p.order_id,
-                        price: p.price,
-                        credential: creds[idx].name.clone(),
-                        ..Default::default()
-                    }
-                } else {
-                    OrderResult {
-                        credential: creds[idx].name.clone(),
-                        price: p.price,
-                        ..OrderResult::fail(p.error)
-                    }
-                }
-            }
-            Err(e) => OrderResult {
-                credential: creds[idx].name.clone(),
-                ..OrderResult::fail(e.to_string())
-            },
-        };
+        let res = order_once_probe(signer, &creds[idx], inspect_id, youpin_id, logs).await;
 
         if res.success {
             creds[idx].status = ck::CredStatus::Active;
@@ -793,7 +751,6 @@ pub async fn order_with_rotation_probe(
             idx = (idx + 1) % n;
             continue;
         }
-        // 风控/过快(601/过快):标橙、可重试,停在这把。
         if res.error.contains("601") || res.error.contains("过快") || res.error.contains("频") {
             creds[idx].status = ck::CredStatus::RiskControlled;
             creds[idx].valid = true;
@@ -801,8 +758,152 @@ pub async fn order_with_rotation_probe(
         break res;
     };
 
-    session.close().await;
     (result, creds, idx)
+}
+
+/// 单把 CK 的完整下单:probe body + WS 签名 + probe send。Step1→构造→Step2,
+/// 命中"提交过快"等 1s 重试一次(对齐 probe order::place_order 的编排)。
+async fn order_once_probe<S: Signer>(
+    signer: &S,
+    cred: &Credential,
+    inspect_id: &str,
+    youpin_id: &str,
+    logs: &mut Vec<String>,
+) -> OrderResult {
+    use h5st_probe::{body as pbody, send as psend};
+
+    let cookies = ck::parse_cookies(&cred.cookie_str);
+    let rp = ck::extract_real_params(&cookies);
+    let device = rp.device_uuid.clone();
+    let ck_str = cred.cookie_str.as_str();
+
+    // ===== Step1: getCurrentOrder(probe body + WS 签名 + probe send)=====
+    let body1 = pbody::build_get_current_order_body(&device, youpin_id, inspect_id);
+    let signed1 = match sign_via_ws(signer, "balance_getCurrentOrder_m", &body1).await {
+        Ok(s) => s,
+        Err(e) => return OrderResult { credential: cred.name.clone(), ..OrderResult::fail(e) },
+    };
+    let r1 = match psend::call(&signed1, ck_str, youpin_id).await {
+        Ok(r) => r,
+        Err(e) => return OrderResult { credential: cred.name.clone(), ..OrderResult::fail(format!("Step1 发请求失败: {e}")) },
+    };
+    logs.push(format!("[{}] step1: http={} code={} seg3={}", cred.name, r1.http_status, r1.code, signed1.seg3));
+    if !r1.is_ok() {
+        let msg = if r1.error_reason.is_empty() {
+            format!("Step1 未成功: code={} {}", r1.code, r1.raw_snippet)
+        } else {
+            r1.error_reason.clone()
+        };
+        return OrderResult { credential: cred.name.clone(), ..OrderResult::fail(msg) };
+    }
+    let b1 = r1.body().clone();
+    let price = b1["balanceTotal"]["factPrice"].to_string();
+
+    // ===== 本地构造 Step2 body(probe)=====
+    let now2 = now_unix_ms();
+    let body2 = pbody::build_submit_order_body(&b1, &device, youpin_id, inspect_id, now2);
+
+    // ===== Step2: submitOrder(probe body + WS 签名 + probe send)+ 过快重试一次 =====
+    let mut r2 = match submit_once_probe(signer, &body2, ck_str, youpin_id).await {
+        Ok(r) => r,
+        Err(e) => return OrderResult { credential: cred.name.clone(), price, ..OrderResult::fail(e) },
+    };
+    if order_too_fast(&r2) {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        let body2_retry = pbody::build_submit_order_body(&b1, &device, youpin_id, inspect_id, now_unix_ms());
+        if let Ok(r) = submit_once_probe(signer, &body2_retry, ck_str, youpin_id).await {
+            r2 = r;
+        }
+    }
+
+    let order_id = order_id_of_probe(&r2);
+    logs.push(format!("[{}] step2: http={} code={}", cred.name, r2.http_status, r2.code));
+    if r2.code == "0" && !order_id.is_empty() && order_id != "null" {
+        let op = r2.body()["order"]["orderPrice"].to_string();
+        OrderResult {
+            success: true,
+            order_id,
+            price: if op.is_empty() || op == "null" { price } else { op },
+            credential: cred.name.clone(),
+            ..Default::default()
+        }
+    } else {
+        let err = if !r2.error_reason.is_empty() {
+            r2.error_reason.clone()
+        } else {
+            format!("未拿到 orderId: {}", r2.raw_snippet)
+        };
+        OrderResult { credential: cred.name.clone(), price, ..OrderResult::fail(err) }
+    }
+}
+
+/// 通过 WS 签名,把结果拼成 probe 的 [`h5st_probe::send::Signed`],供 probe send 使用。
+async fn sign_via_ws<S: Signer>(
+    signer: &S,
+    function_id: &str,
+    body: &serde_json::Value,
+) -> Result<h5st_probe::send::Signed, String> {
+    // body 必须按插入序序列化(serde preserve_order),与签名时哈希的 body 同串。
+    let body_str = serde_json::to_string(body).map_err(|e| e.to_string())?;
+    let t = now_unix_ms() as i64;
+    let h5st = signer.sign(function_id, &body_str, t).await?;
+    // 从 h5st 取第7段当 req_t(与内层 t 一致);取不到则用 t。
+    let req_t = h5st
+        .split(';')
+        .nth(6)
+        .filter(|s| s.chars().all(|c| c.is_ascii_digit()) && !s.is_empty())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| t.to_string());
+    let seg3 = h5st.split(';').nth(3).unwrap_or("").chars().take(8).collect();
+    Ok(h5st_probe::send::Signed {
+        function_id: function_id.to_string(),
+        h5st,
+        body_str,
+        req_t,
+        uuid: "0".to_string(),
+        // 与服务端签名时的 client 一致(服务端按 payload.client=MacIntel 设页面平台)。
+        client: ORDER_CLIENT_PLATFORM.to_string(),
+        seg1: String::new(),
+        seg3,
+        seg7_len: 0,
+    })
+}
+
+async fn submit_once_probe<S: Signer>(
+    signer: &S,
+    body2: &serde_json::Value,
+    ck: &str,
+    youpin: &str,
+) -> Result<h5st_probe::send::CallResult, String> {
+    let signed = sign_via_ws(signer, "balance_submitOrder_m", body2).await?;
+    h5st_probe::send::call(&signed, ck, youpin)
+        .await
+        .map_err(|e| format!("Step2 发请求失败: {e}"))
+}
+
+fn order_id_of_probe(r: &h5st_probe::send::CallResult) -> String {
+    let b = r.body();
+    for v in [&b["order"]["orderId"], &b["orderId"], &r.json["orderId"]] {
+        if let Some(s) = v.as_str() {
+            if !s.is_empty() {
+                return s.to_string();
+            }
+        }
+        if v.is_number() {
+            return v.to_string();
+        }
+    }
+    String::new()
+}
+
+fn order_too_fast(r: &h5st_probe::send::CallResult) -> bool {
+    let reason = &r.error_reason;
+    reason.contains("过快") || reason.contains("稍后") || reason.contains("频")
+}
+
+fn now_unix_ms() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
 }
 
 /// Build the dingtalk product link (spec §6.1).

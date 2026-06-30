@@ -700,6 +700,111 @@ pub async fn order_with_rotation<S: Signer, H: OrderHttp>(
     (OrderResult::fail("所有凭证均已尝试"), creds, idx)
 }
 
+/// 下单(probe 库版):直接复用 h5st-probe 验证过能下单的整套(本地 headless 签名 +
+/// 造 body + wreq 发),多 CK 轮换/状态机与 [`order_with_rotation`] 一致。
+///
+/// 与旧版的区别:签名不走 WS 服务端,而是 client 本地开一个 headless Chrome 签名会话
+/// (= probe 的 SignSession),Step1/Step2 共用同一会话(同一 __jda)。整个轮换共用
+/// 一个会话(像 probe 一台浏览器)。需要运行机器装有 Chrome。
+pub async fn order_with_rotation_probe(
+    mut creds: Vec<Credential>,
+    active_idx: usize,
+    inspect_id: &str,
+    youpin_id: &str,
+    logs: &mut Vec<String>,
+) -> (OrderResult, Vec<Credential>, usize) {
+    if creds.is_empty() {
+        return (OrderResult::fail("没有可用凭证"), creds, 0);
+    }
+
+    // 开一个本地 headless 签名会话(无CK,JD 自动 __jda),整个轮换共用。
+    let session = match h5st_probe::sign::SignSession::open().await {
+        Ok(s) => s,
+        Err(e) => {
+            logs.push(format!("打开本地签名会话失败(是否装了 Chrome?): {e}"));
+            return (OrderResult::fail(format!("签名会话失败: {e}")), creds, active_idx);
+        }
+    };
+
+    let n = creds.len();
+    let mut idx = active_idx.min(n - 1);
+    let mut tried = 0;
+
+    let result = loop {
+        if tried >= n {
+            break OrderResult::fail("所有凭证均已尝试");
+        }
+        if creds[idx].status == ck::CredStatus::Expired {
+            idx = (idx + 1) % n;
+            tried += 1;
+            continue;
+        }
+        logs.push(format!("使用凭证: {}", creds[idx].name));
+
+        let place = h5st_probe::order::place_order(
+            &session,
+            &creds[idx].cookie_str,
+            youpin_id,
+            inspect_id,
+            true, // 真提交
+        )
+        .await;
+
+        let res: OrderResult = match place {
+            Ok(p) => {
+                logs.push(format!("[{}] {}", creds[idx].name, p.diag));
+                if p.success {
+                    OrderResult {
+                        success: true,
+                        order_id: p.order_id,
+                        price: p.price,
+                        credential: creds[idx].name.clone(),
+                        ..Default::default()
+                    }
+                } else {
+                    OrderResult {
+                        credential: creds[idx].name.clone(),
+                        price: p.price,
+                        ..OrderResult::fail(p.error)
+                    }
+                }
+            }
+            Err(e) => OrderResult {
+                credential: creds[idx].name.clone(),
+                ..OrderResult::fail(e.to_string())
+            },
+        };
+
+        if res.success {
+            creds[idx].status = ck::CredStatus::Active;
+            creds[idx].valid = true;
+            break res;
+        }
+        logs.push(format!("提交失败 ({}): {}", creds[idx].name, res.error));
+        if needs_rotation(&res.error) {
+            creds[idx].status = ck::CredStatus::Expired;
+            creds[idx].valid = false;
+            tried += 1;
+            if n == 1 || tried >= n || !creds.iter().any(|c| c.is_active()) {
+                logs.push("所有凭证均不可用，请更新凭证".into());
+                break OrderResult { error: format!("所有凭证均不可用: {}", res.error), ..res };
+            }
+            logs.push(format!("凭证 {} 已失效，自动切换", creds[idx].name));
+            idx = (idx + 1) % n;
+            continue;
+        }
+        // 风控/过快(601/过快):标橙、可重试,停在这把。
+        if res.error.contains("601") || res.error.contains("过快") || res.error.contains("频") {
+            creds[idx].status = ck::CredStatus::RiskControlled;
+            creds[idx].valid = true;
+        }
+        break res;
+    };
+
+    session.close().await;
+    (result, creds, idx)
+}
+
 /// Build the dingtalk product link (spec §6.1).
 pub fn product_link(youpin_id: &str, inspect_id: &str) -> String {
     format!("https://item.m.jd.com/product/{youpin_id}.html?inspectSkuId={inspect_id}")

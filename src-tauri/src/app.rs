@@ -734,9 +734,10 @@ async fn on_sku_hit(app: AppHandle, state: Arc<AppState>, sku: Value) {
     let creds = state.creds.lock().await.clone();
     let active = *state.active_idx.lock().await;
 
+    let _ = &ws; // 下单改走本地 probe 签名;ws 仍用于规则/监控同步,保留连接
     let mut logs: Vec<String> = Vec::new();
-    let (result, updated, new_active) = order::order_with_rotation(
-        &ws, &state.http, creds, active, &inspect_id, &youpin_id, now_ms(), &mut logs,
+    let (result, updated, new_active) = order::order_with_rotation_probe(
+        creds, active, &inspect_id, &youpin_id, &mut logs,
     )
     .await;
     for m in logs {
@@ -857,15 +858,14 @@ pub async fn manual_submit(
     inspect_id: String,
     youpin_id: String,
 ) -> Result<Value, String> {
-    let ws = state.ws.lock().await.as_ref().cloned().ok_or("研究功能尚未就绪")?;
+    // 下单走本地 probe 签名;不再要求 WS 连接(手动下单可脱离 WS 进行)。
     // Same serialization + write-back-clamp as auto submit.
     let _order_guard = state.order_lock.lock().await;
     let creds = state.creds.lock().await.clone();
     let active = *state.active_idx.lock().await;
     let mut logs = Vec::new();
-    let (result, updated, new_active) = order::order_with_rotation(
-        &ws, &state.http, creds, active, &inspect_id, &youpin_id, now_ms(),
-        &mut logs,
+    let (result, updated, new_active) = order::order_with_rotation_probe(
+        creds, active, &inspect_id, &youpin_id, &mut logs,
     )
     .await;
     {

@@ -86,6 +86,15 @@ jobs:
         with:
           workspaces: src-tauri
 
+      # h5st-probe 是私有仓的 cargo git 依赖。用 PRIVATE_REPO_TOKEN 让 cargo
+      # 拉取时带凭据(对所有 github.com https 访问生效,跨平台)。同时强制
+      # cargo 用 git CLI 抓取,确保 insteadOf 凭据被采用。
+      - name: Configure git auth for private cargo deps
+        shell: bash
+        run: |
+          git config --global url."https://x-access-token:${{ secrets.PRIVATE_REPO_TOKEN }}@github.com/".insteadOf "https://github.com/"
+          echo "CARGO_NET_GIT_FETCH_WITH_CLI=true" >> "$GITHUB_ENV"
+
       - name: "Rewrite talon-ui link: deps to published npm versions"
         shell: bash
         run: |

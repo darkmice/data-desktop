@@ -34,6 +34,13 @@ base64 = "0.22"
 urlencoding = "2"
 aes-gcm = "0.10"
 rand = "0.8"
+# h5st-probe 作为库直接引用:下单全套(造body/本地headless签名/wreq发请求)用
+# probe 已实测能下单的同一份代码,不再在客户端维护副本(避免逐字段漂移)。
+# git 依赖(私有仓):本机用你的 git 凭据拉,CI 用 PRIVATE_REPO_TOKEN(见
+# build-client.yml 的 insteadOf 改写)。本机要改 probe 调试时可临时换回
+# `{ path = "../../../h5st-probe" }`。
+h5st-probe = { git = "https://github.com/darkmice/h5st-probe.git", branch = "main" }
+chromiumoxide = { version = "0.7", default-features = false, features = ["tokio-runtime", "bytes"] }
 
 # Tauri 2 + plugins (added for the shell; core logic does not depend on them)
 tauri = { version = "2", features = [] }

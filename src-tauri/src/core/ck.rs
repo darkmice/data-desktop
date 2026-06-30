@@ -94,17 +94,16 @@ pub fn has_pt_key(cookies: &BTreeMap<String, String>) -> bool {
 }
 
 /// 下单必需的关键 cookie key(缺任一则该 CK 不可用于下单)。
-/// 经实测确认:CK 必须完整携带这些登录 + 风控设备指纹项,缺了即使签名完美也会被风控拦下。
+/// 只保留登录态与基础设备指纹项。移除 3AB9D23F7A4B3C9B / 3AB9D23F7A4B3CSS /
+/// shshshfpv —— JD app 端导出的 CK 不带这几项(它们是 H5/PC 端的字段),强制要求会
+/// 误拒 app 端有效 CK。签名走服务端 headless 现场种 __jda,不依赖这些字段。
 pub const REQUIRED_KEYS: &[&str] = &[
     "pt_key",
     "pt_pin",
-    "3AB9D23F7A4B3C9B",
-    "3AB9D23F7A4B3CSS",
     "__jda",
     "shshshfpa",
     "shshshfpb",
     "shshshfpx",
-    "shshshfpv",
     "unionwsws",
 ];
 
@@ -203,11 +202,15 @@ mod tests {
         // SAMPLE 只有 pt_key/__jda/3AB9D23F7A4B3C9B,缺其余必需项。
         let missing = missing_required_keys(&parse_cookies(SAMPLE));
         assert!(missing.contains(&"pt_pin"));
-        assert!(missing.contains(&"3AB9D23F7A4B3CSS"));
+        assert!(missing.contains(&"shshshfpa"));
         assert!(missing.contains(&"shshshfpb"));
         assert!(missing.contains(&"unionwsws"));
         assert!(!missing.contains(&"pt_key"));
         assert!(!missing.contains(&"__jda"));
+        // 这几项已不再强制(app 端 CK 不带),即使缺也不算 missing。
+        assert!(!missing.contains(&"3AB9D23F7A4B3C9B"));
+        assert!(!missing.contains(&"3AB9D23F7A4B3CSS"));
+        assert!(!missing.contains(&"shshshfpv"));
     }
 
     #[test]

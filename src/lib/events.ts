@@ -9,6 +9,7 @@ import { logKind, notify, TX, useStore } from '../store/useStore';
 import type {
   Category,
   ConnStatus,
+  Credential,
   OrderRecord,
   OrderStats,
   WatchParams,
@@ -52,6 +53,10 @@ export async function setupEvents(): Promise<void> {
       interval: p.interval ?? 3,
       max_threads: p.max_threads ?? 5,
     });
+  });
+
+  await listen<{ items: Credential[] }>('credentials', (p) => {
+    s.setCreds(p.items ?? []);
   });
 
   // 监控存活脉冲:服务端每扫完一圈下发一次(空载,不含任何扫描细节)。仅用于

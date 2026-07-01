@@ -5,11 +5,12 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-/// 凭证状态。区分两种"不可用":
+/// 凭证状态。区分三种"不可用/需关注":
 /// - `RiskControlled`(风控 / 601):间歇性,慢点用同一把 CK 重试可能就成 → 前端橙色,
 ///   用户可手动「解除」改回 Active 再试。
 /// - `Expired`(过期 / 302 / 登录失效):CK 真失效,需换新 CK → 前端红色。也允许手动
 ///   「解除」(比如用户刚更新了同名 CK 想重置状态)。
+/// - `Disabled`:用户手动禁用,不参与提交流程,但仍保留在列表中并可继续验活。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CredStatus {
     /// 可用。
@@ -18,6 +19,8 @@ pub enum CredStatus {
     RiskControlled,
     /// 登录态失效(302 / CK 过期),需换 CK。
     Expired,
+    /// 用户手动禁用,不参与提交流程。
+    Disabled,
 }
 
 impl Default for CredStatus {
@@ -33,7 +36,7 @@ pub struct Credential {
     pub name: String,
     /// Raw cookie string as pasted from the browser.
     pub cookie_str: String,
-    /// 当前状态。下单轮换据此判断是否跳过(只有 Active 参与下单)。
+    /// 当前状态。提交流程据此判断是否跳过。
     /// 旧数据无此字段时默认 Active;同时兼容旧的布尔 `valid` 字段(见 valid()/反序列化)。
     #[serde(default)]
     pub status: CredStatus,
@@ -57,9 +60,14 @@ fn default_true() -> bool {
 }
 
 impl Credential {
-    /// 是否可用于下单(只有 Active 参与)。取代旧的裸 `valid` 判断。
+    /// 是否可直接显示为正常可用。
     pub fn is_active(&self) -> bool {
         self.status == CredStatus::Active
+    }
+
+    /// 是否可参与提交流程。风控态允许重试;过期/手动禁用不参与。
+    pub fn can_order(&self) -> bool {
+        matches!(self.status, CredStatus::Active | CredStatus::RiskControlled)
     }
 
     /// 读旧持久化数据时调用:若 status 缺省为 Active 但旧 `valid=false`,迁移为 Expired
@@ -68,8 +76,8 @@ impl Credential {
         if self.status == CredStatus::Active && !self.valid {
             self.status = CredStatus::Expired;
         }
-        // 统一让 valid 反映 status,避免两字段不一致(虽然 valid 不再被读)。
-        self.valid = self.status == CredStatus::Active;
+        // 统一让 valid 反映是否可提交,避免两字段不一致(虽然 valid 不再被读)。
+        self.valid = self.can_order();
     }
 }
 

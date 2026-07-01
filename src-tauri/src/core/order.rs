@@ -749,9 +749,9 @@ pub async fn order_with_rotation<S: Signer, H: OrderHttp>(
     let mut tried = 0;
 
     while tried < n {
-        // 只跳过【已过期】凭证(需换 CK);风控(RiskControlled)凭证仍允许重试
-        // (601 间歇性),只是前端标橙提示。这样修好了"601 后再下单连签名都不发"的 bug。
-        if creds[idx].status == ck::CredStatus::Expired {
+        // 跳过不可下单凭证:Expired(需换 CK)和 Disabled(用户手动禁用)。
+        // RiskControlled 仍允许重试(601 间歇性),只是前端标橙提示。
+        if !creds[idx].can_order() {
             idx = (idx + 1) % n;
             tried += 1;
             continue;
@@ -770,7 +770,7 @@ pub async fn order_with_rotation<S: Signer, H: OrderHttp>(
             creds[idx].status = ck::CredStatus::Expired;
             creds[idx].valid = false;
             tried += 1;
-            if n == 1 || tried >= n || !creds.iter().any(|c| c.is_active()) {
+            if n == 1 || tried >= n || !creds.iter().any(|c| c.can_order()) {
                 logs.push("所有凭证均不可用，请更新凭证".into());
                 return (
                     OrderResult {
@@ -820,7 +820,7 @@ pub async fn order_with_rotation_probe<S: Signer>(
         if tried >= n {
             break OrderResult::fail("所有凭证均已尝试");
         }
-        if creds[idx].status == ck::CredStatus::Expired {
+        if !creds[idx].can_order() {
             idx = (idx + 1) % n;
             tried += 1;
             continue;
@@ -838,7 +838,7 @@ pub async fn order_with_rotation_probe<S: Signer>(
             creds[idx].status = ck::CredStatus::Expired;
             creds[idx].valid = false;
             tried += 1;
-            if n == 1 || tried >= n || !creds.iter().any(|c| c.is_active()) {
+            if n == 1 || tried >= n || !creds.iter().any(|c| c.can_order()) {
                 logs.push("所有凭证均不可用，请更新凭证".into());
                 break OrderResult {
                     error: format!("所有凭证均不可用: {}", res.error),
@@ -869,8 +869,13 @@ pub async fn order_with_assigned_credential_probe<S: Signer>(
     youpin_id: &str,
     logs: &mut Vec<String>,
 ) -> (OrderResult, Credential) {
-    if cred.status == ck::CredStatus::Expired {
-        return (OrderResult::fail("凭证已过期,请更新凭证"), cred);
+    if !cred.can_order() {
+        let reason = match cred.status {
+            ck::CredStatus::Expired => "凭证已过期,请更新凭证",
+            ck::CredStatus::Disabled => "凭证已禁用",
+            _ => "凭证不可用",
+        };
+        return (OrderResult::fail(reason), cred);
     }
 
     logs.push(format!("使用凭证: {}", cred.name));
@@ -1600,6 +1605,36 @@ mod tests {
         assert!(!r.success);
         assert_eq!(updated.status, ck::CredStatus::Expired);
         assert!(logs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn assigned_probe_rejects_disabled_credential() {
+        let mut logs = Vec::new();
+        let mut one = creds(&["a"]).remove(0);
+        one.status = ck::CredStatus::Disabled;
+        one.valid = false;
+        let (r, updated) =
+            order_with_assigned_credential_probe(&FakeSigner, one, "i1", "y1", &mut logs).await;
+        assert!(!r.success);
+        assert!(r.error.contains("禁用"));
+        assert_eq!(updated.status, ck::CredStatus::Disabled);
+        assert!(logs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn disabled_credentials_are_skipped_in_rotation() {
+        let mut all = creds(&["a", "b"]);
+        all[0].status = ck::CredStatus::Disabled;
+        all[0].valid = false;
+        let mut logs = Vec::new();
+        let (r, updated, idx) =
+            order_with_rotation(&FakeSigner, &OkHttp, all, 0, "i1", "y1", 1000, &mut logs).await;
+        assert!(r.success);
+        assert_eq!(r.credential, "b");
+        assert_eq!(idx, 1);
+        assert_eq!(updated[0].status, ck::CredStatus::Disabled);
+        assert!(logs.iter().any(|l| l.contains("使用凭证: b")));
+        assert!(!logs.iter().any(|l| l.contains("使用凭证: a")));
     }
 
     /// 601 = 风控(间歇性),不是凭证失效:必须【不轮换、不禁用凭证】,失败返回但

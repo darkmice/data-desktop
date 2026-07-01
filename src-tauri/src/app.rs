@@ -468,15 +468,21 @@ pub async fn import_credential(
         .cloned()
         .ok_or("请先连接服务端,导入 CK 需要 h5st 签名验活")?;
     let checked_at = now_ms();
-    let verify = ck_alive::verify(&ws, &state.notify_http, &credential, checked_at).await?;
     credential.last_alive_check_ms = checked_at;
-    credential.last_alive_ok = Some(verify.alive);
-    credential.last_alive_message = verify.message.clone();
-    if !verify.alive {
-        credential.status = ck::CredStatus::Expired;
-        credential.valid = false;
-        return Err(verify.message);
+    match ck_alive::verify(&ws, &state.notify_http, &credential, checked_at).await {
+        Ok(verify) => {
+            credential.last_alive_ok = Some(verify.alive);
+            credential.last_alive_message = verify.message.clone();
+            if !verify.alive {
+                credential.status = ck::CredStatus::Expired;
+            }
+        }
+        Err(e) => {
+            credential.last_alive_ok = None;
+            credential.last_alive_message = e;
+        }
     }
+    credential.valid = credential.can_order();
 
     {
         let mut creds = state.creds.lock().await;
@@ -533,6 +539,55 @@ pub async fn clear_credential_status(
     }
     persist(&state, KV_CREDS, &*state.creds.lock().await);
     Ok(())
+}
+
+#[tauri::command]
+pub async fn set_credential_disabled(
+    state: State<'_, Arc<AppState>>,
+    index: usize,
+    disabled: bool,
+) -> Result<(), String> {
+    {
+        let mut creds = state.creds.lock().await;
+        if index >= creds.len() {
+            return Err("凭证不存在".into());
+        }
+        creds[index].status = if disabled {
+            ck::CredStatus::Disabled
+        } else {
+            ck::CredStatus::Active
+        };
+        creds[index].valid = creds[index].can_order();
+    }
+    persist(&state, KV_CREDS, &*state.creds.lock().await);
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn check_all_credentials_alive(
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+) -> Result<usize, String> {
+    if state.ws.lock().await.is_none() {
+        return Err("请先连接服务端,CK 验活需要服务端签名".into());
+    }
+    let count = state.creds.lock().await.len();
+    if count == 0 {
+        return Ok(0);
+    }
+
+    let app2 = app.clone();
+    let state2 = state.inner().clone();
+    tauri::async_runtime::spawn(async move {
+        let spacing = ck_alive_spacing(count);
+        for index in 0..count {
+            if index > 0 && !spacing.is_zero() {
+                tokio::time::sleep(spacing).await;
+            }
+            verify_credential_alive_index(&app2, &state2, index, "手动", true).await;
+        }
+    });
+    Ok(count)
 }
 
 #[tauri::command]
@@ -720,6 +775,10 @@ fn emit(app: &AppHandle, event: &str, payload: Value) {
     let _ = app.emit(event, payload);
 }
 
+fn emit_credentials(app: &AppHandle, creds: &[Credential]) {
+    emit(app, "credentials", json!({ "items": creds }));
+}
+
 /// Emit a client-originated operation log to the local UI AND mirror it up to the
 /// server (for the admin live view). `level` is "info"|"hit"|"err". The server
 /// mirror is best-effort: a dead/missing connection is silently skipped (the
@@ -776,6 +835,7 @@ async fn verify_credential_alive_index(
     state: &Arc<AppState>,
     index: usize,
     reason: &str,
+    force: bool,
 ) {
     let Some(ws) = state.ws.lock().await.as_ref().cloned() else {
         return;
@@ -784,7 +844,8 @@ async fn verify_credential_alive_index(
         return;
     };
     let now = now_ms();
-    if snapshot.last_alive_check_ms > 0
+    if !force
+        && snapshot.last_alive_check_ms > 0
         && now.saturating_sub(snapshot.last_alive_check_ms) < CK_ALIVE_MIN_INTERVAL_MS
     {
         return;
@@ -806,13 +867,15 @@ async fn verify_credential_alive_index(
             if r.alive {
                 if slot.status == ck::CredStatus::Expired {
                     slot.status = ck::CredStatus::Active;
-                    slot.valid = true;
                 }
             } else {
-                slot.status = ck::CredStatus::Expired;
-                slot.valid = false;
+                if slot.status != ck::CredStatus::Disabled {
+                    slot.status = ck::CredStatus::Expired;
+                }
             }
+            slot.valid = slot.can_order();
             persist(state, KV_CREDS, &*creds);
+            emit_credentials(app, &creds);
             (r.alive, r.message)
         }
         Err(e) => {
@@ -826,7 +889,9 @@ async fn verify_credential_alive_index(
             slot.last_alive_check_ms = now;
             slot.last_alive_ok = None;
             slot.last_alive_message = e.clone();
+            slot.valid = slot.can_order();
             persist(state, KV_CREDS, &*creds);
+            emit_credentials(app, &creds);
             emit(
                 app,
                 "log",
@@ -858,7 +923,7 @@ async fn run_ck_alive_scheduler(app: AppHandle, state: Arc<AppState>) {
             if pos > 0 && !spacing.is_zero() {
                 tokio::time::sleep(spacing).await;
             }
-            verify_credential_alive_index(&app, &state, index, "定时").await;
+            verify_credential_alive_index(&app, &state, index, "定时", false).await;
         }
 
         tokio::time::sleep(CK_ALIVE_SCAN_POLL).await;
@@ -876,7 +941,7 @@ fn usable_credential_indices(creds: &[Credential], active_idx: usize) -> Vec<usi
     let start = active_idx.min(creds.len() - 1);
     (0..creds.len())
         .map(|offset| (start + offset) % creds.len())
-        .filter(|&idx| creds[idx].status != ck::CredStatus::Expired)
+        .filter(|&idx| creds[idx].can_order())
         .collect()
 }
 
@@ -964,9 +1029,12 @@ async fn apply_auto_credential_update(
     let Some(slot) = creds.get_mut(lease.ck_index) else {
         return;
     };
+    if slot.status == ck::CredStatus::Disabled {
+        return;
+    }
     if slot.name == lease.credential.name && slot.cookie_str == lease.credential.cookie_str {
         slot.status = updated.status;
-        slot.valid = updated.valid;
+        slot.valid = slot.can_order() && updated.valid;
         persist(state, KV_CREDS, &*creds);
     }
 }
@@ -1471,6 +1539,8 @@ pub fn run() {
             delete_credential,
             use_credential,
             clear_credential_status,
+            set_credential_disabled,
+            check_all_credentials_alive,
             get_rules,
             save_rules,
             reenable_rule,
@@ -1572,6 +1642,44 @@ mod tests {
         assert!(first.start_delay.is_zero());
         assert!(second.start_delay.is_zero());
         assert!(matches!(third, AutoSubmitReserve::Drop("all_ck_busy")));
+    }
+
+    #[tokio::test]
+    async fn auto_submit_skips_disabled_credentials() {
+        let state = AppState::new();
+        let mut disabled = test_credential("a");
+        disabled.status = ck::CredStatus::Disabled;
+        disabled.valid = false;
+        *state.creds.lock().await = vec![disabled, test_credential("b")];
+
+        let first = reserve_auto_submit(&state, "i1|y1".into(), 1).await;
+        let second = reserve_auto_submit(&state, "i2|y2".into(), 1).await;
+        let third = reserve_auto_submit(&state, "i3|y3".into(), 1).await;
+
+        let AutoSubmitReserve::Run(first) = first else {
+            panic!("active hit should run");
+        };
+        let AutoSubmitReserve::Run(second) = second else {
+            panic!("second active hit should run with single-ck pacing");
+        };
+        assert_eq!(first.ck_index, 1);
+        assert_eq!(second.ck_index, 1);
+        assert!(matches!(
+            third,
+            AutoSubmitReserve::Drop("single_ck_queue_full")
+        ));
+    }
+
+    #[tokio::test]
+    async fn auto_submit_drops_when_all_credentials_disabled() {
+        let state = AppState::new();
+        let mut disabled = test_credential("a");
+        disabled.status = ck::CredStatus::Disabled;
+        disabled.valid = false;
+        *state.creds.lock().await = vec![disabled];
+
+        let first = reserve_auto_submit(&state, "i1|y1".into(), 1).await;
+        assert!(matches!(first, AutoSubmitReserve::Drop("no_usable_ck")));
     }
 
     #[tokio::test]

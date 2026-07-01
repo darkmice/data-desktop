@@ -12,6 +12,7 @@ export function Credentials() {
 
   const [name, setName] = useState('');
   const [cookie, setCookie] = useState('');
+  const [checking, setChecking] = useState(false);
 
   async function refresh() {
     try {
@@ -50,7 +51,29 @@ export function Credentials() {
     await refresh();
   }
 
-  // 手动解除风控/过期状态 → 改回 Active,可重新参与下单。
+  async function checkAll() {
+    setChecking(true);
+    try {
+      const n = await invoke<number>('check_all_credentials_alive');
+      notify(n > 0 ? `已开始检查 ${n} 个 CK` : '暂无 CK 可检查');
+    } catch (e) {
+      notify(`检查失败: ${String(e)}`, 'err');
+    } finally {
+      setChecking(false);
+    }
+  }
+
+  async function setDisabled(i: number, disabled: boolean) {
+    try {
+      await invoke('set_credential_disabled', { index: i, disabled });
+      notify(disabled ? '已禁用凭证,不会参与自动提交' : '已启用凭证');
+      await refresh();
+    } catch (e) {
+      notify(`${disabled ? '禁用' : '启用'}失败: ${String(e)}`, 'err');
+    }
+  }
+
+  // 手动解除风控/过期状态 → 改回 Active,可重新参与提交流程。
   async function clearStatus(i: number) {
     try {
       await invoke('clear_credential_status', { index: i });
@@ -88,6 +111,13 @@ export function Credentials() {
       </Card>
 
       <Card className="flex flex-col gap-tp-2 p-tp-4">
+        {creds.length > 0 && (
+          <div className="flex justify-end pb-tp-2">
+            <Button variant="ghost" size="sm" loading={checking} onClick={checkAll}>
+              检查全部
+            </Button>
+          </div>
+        )}
         {creds.length === 0 ? (
           <Empty description="暂无凭证" />
         ) : (
@@ -104,8 +134,11 @@ export function Credentials() {
                 {c.name || '未命名'}
               </span>
               {(() => {
-                // 状态标签(不同色):可用=绿,风控=橙(可重试),过期=红(需换CK)。
+                // 状态标签(不同色):可用=绿,风控=橙(可重试),过期/禁用=红/灰。
                 const status = c.status ?? (c.valid === false ? 'Expired' : 'Active');
+                if (status === 'Disabled') {
+                  return <Tag tone="info" size="sm">已禁用</Tag>;
+                }
                 if (status === 'RiskControlled') {
                   // progress = 橙/黄色调:风控冷却中,可手动解除后重试。
                   return <Tag tone="progress" size="sm">风控</Tag>;
@@ -115,7 +148,21 @@ export function Credentials() {
                 }
                 return <Tag tone="done" size="sm">可用</Tag>;
               })()}
-              {(c.status ?? 'Active') !== 'Active' && (
+              {c.last_alive_ok === false && (
+                <Tag tone="blocked" size="sm">验活失败</Tag>
+              )}
+              {c.last_alive_ok == null && (c.last_alive_check_ms ?? 0) > 0 && (
+                <Tag tone="progress" size="sm">验活异常</Tag>
+              )}
+              {c.last_alive_message && (
+                <span
+                  className="max-w-[180px] truncate text-xs text-text-tertiary"
+                  title={c.last_alive_message}
+                >
+                  {c.last_alive_message}
+                </span>
+              )}
+              {['RiskControlled', 'Expired'].includes(c.status ?? 'Active') && (
                 <Button
                   variant="ghost"
                   size="sm"
@@ -124,6 +171,27 @@ export function Credentials() {
                   title="解除风控/过期状态,恢复可用"
                 >
                   解除
+                </Button>
+              )}
+              {(c.status ?? 'Active') === 'Disabled' ? (
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="shrink-0 whitespace-nowrap"
+                  onClick={() => setDisabled(i, false)}
+                  title="重新启用凭证"
+                >
+                  启用
+                </Button>
+              ) : (
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="shrink-0 whitespace-nowrap"
+                  onClick={() => setDisabled(i, true)}
+                  title="禁用后不会参与自动提交"
+                >
+                  禁用
                 </Button>
               )}
               {i === activeIdx ? (

@@ -67,13 +67,17 @@ export interface WatchParams {
 /** 凭证状态(与 Rust CredStatus 对齐:serde 把无字段枚举序列化为变体名字符串)。
  *  - Active:可用
  *  - RiskControlled:触发风控(601),间歇性,可手动解除后重试(前端橙色)
- *  - Expired:登录态失效(302/CK 过期),需换 CK(前端红色) */
-export type CredStatus = 'Active' | 'RiskControlled' | 'Expired';
+ *  - Expired:登录态失效(302/CK 过期),需换 CK(前端红色)
+ *  - Disabled:用户手动禁用,不参与提交流程 */
+export type CredStatus = 'Active' | 'RiskControlled' | 'Expired' | 'Disabled';
 
 export interface Credential {
   name: string;
   cookie_str: string;
   status: CredStatus;
+  last_alive_check_ms?: number;
+  last_alive_ok?: boolean | null;
+  last_alive_message?: string;
   /** 兼容旧字段;新代码用 status。 */
   valid?: boolean;
 }

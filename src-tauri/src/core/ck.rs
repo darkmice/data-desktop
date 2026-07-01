@@ -37,6 +37,15 @@ pub struct Credential {
     /// 旧数据无此字段时默认 Active;同时兼容旧的布尔 `valid` 字段(见 valid()/反序列化)。
     #[serde(default)]
     pub status: CredStatus,
+    /// 最近一次 CK 存活验证时间(ms epoch)。0 表示尚未验证/旧数据。
+    #[serde(default)]
+    pub last_alive_check_ms: i64,
+    /// 最近一次存活验证结果。None 表示验证异常(签名/网络/未知响应),不据此禁用 CK。
+    #[serde(default)]
+    pub last_alive_ok: Option<bool>,
+    /// 最近一次存活验证的人类可读结果,仅用于界面/日志提示。
+    #[serde(default)]
+    pub last_alive_message: String,
     /// 兼容旧持久化格式的布尔字段:旧数据只有 `valid`,无 `status`。仅用于读旧数据时
     /// 迁移(见 migrate_legacy_valid),新代码一律用 `status`。
     #[serde(default = "default_true", skip_serializing)]

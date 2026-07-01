@@ -42,6 +42,9 @@ pub struct SignResult {
     /// optional for older signers, but the probe order path uses it when the
     /// pasted CK does not carry `visitkey`/`__jda`.
     pub device_uuid: Option<String>,
+    /// Full server-built request params. Order ignores this today, but CK alive
+    /// uses it so `client`/`clientVersion` come from the server signer path.
+    pub request_params: Value,
 }
 
 impl OrderResult {
@@ -1295,6 +1298,7 @@ mod tests {
             Ok(SignResult {
                 h5st: "fakeh5st".into(),
                 device_uuid: None,
+                ..Default::default()
             })
         }
     }
@@ -1310,6 +1314,7 @@ mod tests {
             Ok(SignResult {
                 h5st: "fakeh5st".into(),
                 device_uuid: Some(self.0.to_string()),
+                ..Default::default()
             })
         }
     }
@@ -1325,6 +1330,7 @@ mod tests {
             Ok(SignResult {
                 h5st: "fakeh5st".into(),
                 device_uuid: None,
+                ..Default::default()
             })
         }
     }
@@ -1375,6 +1381,9 @@ mod tests {
                 name: n.to_string(),
                 cookie_str: "pt_key=x; visitkey=v".into(),
                 status: ck::CredStatus::Active,
+                last_alive_check_ms: 0,
+                last_alive_ok: None,
+                last_alive_message: String::new(),
                 valid: true,
             })
             .collect()

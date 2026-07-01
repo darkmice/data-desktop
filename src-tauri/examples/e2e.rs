@@ -86,18 +86,26 @@ async fn main() -> anyhow::Result<()> {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_millis() as i64;
-    let h5st = ws
+    let signed = ws
         .sign("balance_getCurrentOrder_m", r#"{"probe":1}"#, now_ms)
         .await
         .map_err(|e| anyhow::anyhow!("sign over WS failed: {e}"))?;
-    println!("[3] Signer round-trip OK: h5st_len={} seg3={}", h5st.len(), h5st.split(';').nth(2).unwrap_or("?"));
+    println!("[3] Signer round-trip OK: h5st_len={} seg3={}", signed.h5st.len(), signed.h5st.split(';').nth(2).unwrap_or("?"));
 
     // 4. Full order flow against the live server (signing real; JD call may
     //    302/601 with an expired CK — wiring is what we verify here).
     let ck = std::fs::read_to_string("/Users/dark/WebstormProjects/tauri-webview-h5st/docs/id.txt")
         .unwrap_or_default();
     if !ck.trim().is_empty() {
-        let creds = vec![Credential { name: "test".into(), cookie_str: ck.trim().to_string(), status: ck::CredStatus::Active, valid: true }];
+        let creds = vec![Credential {
+            name: "test".into(),
+            cookie_str: ck.trim().to_string(),
+            status: ck::CredStatus::Active,
+            last_alive_check_ms: 0,
+            last_alive_ok: None,
+            last_alive_message: String::new(),
+            valid: true,
+        }];
         let http = WreqHttp::new();
         let mut logs = Vec::new();
         let (res, _creds, _idx) = order::order_with_rotation(
@@ -111,7 +119,7 @@ async fn main() -> anyhow::Result<()> {
     println!("\n========== E2E RESULT ==========");
     println!("WsClient connect/auth: ✅");
     println!("set_rules/watch/status: ✅");
-    println!("Signer WS round-trip:   ✅ (seg3={})", h5st.split(';').nth(2).unwrap_or("?"));
+    println!("Signer WS round-trip:   ✅ (seg3={})", signed.h5st.split(';').nth(2).unwrap_or("?"));
     println!("order flow wiring:      ✅ (signing over WS works end-to-end)");
     Ok(())
 }

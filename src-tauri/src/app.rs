@@ -14,6 +14,7 @@ use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::{mpsc, Mutex};
 
 use crate::core::ck::{self, Credential};
+use crate::core::ck_alive;
 use crate::core::history::{Filter, HistoryStore, OrderRecord};
 use crate::core::notify::channel::Subscriptions;
 use crate::core::notify::event::EventKind;
@@ -80,6 +81,10 @@ fn default_auto_submit_delay_secs() -> u64 {
 fn sanitize_auto_submit_delay_secs(v: u64) -> u64 {
     v.clamp(1, 3)
 }
+
+const CK_ALIVE_MIN_INTERVAL_MS: i64 = 60 * 60 * 1000;
+const CK_ALIVE_SCAN_POLL: Duration = Duration::from_secs(60);
+const CK_ALIVE_SPREAD_WINDOW: Duration = Duration::from_secs(10 * 60);
 
 fn sanitize_config(mut cfg: AppConfig) -> AppConfig {
     cfg.auto_submit_delay_secs = sanitize_auto_submit_delay_secs(cfg.auto_submit_delay_secs);
@@ -440,18 +445,42 @@ pub async fn import_credential(
     }
 
     let count = cookies.len();
+    let display_name = if name.trim().is_empty() {
+        "未命名".to_string()
+    } else {
+        name.trim().to_string()
+    };
+    let mut credential = Credential {
+        name: display_name,
+        cookie_str,
+        status: ck::CredStatus::Active,
+        last_alive_check_ms: 0,
+        last_alive_ok: None,
+        last_alive_message: String::new(),
+        valid: true,
+    };
+
+    let ws = state
+        .ws
+        .lock()
+        .await
+        .as_ref()
+        .cloned()
+        .ok_or("请先连接服务端,导入 CK 需要 h5st 签名验活")?;
+    let checked_at = now_ms();
+    let verify = ck_alive::verify(&ws, &state.notify_http, &credential, checked_at).await?;
+    credential.last_alive_check_ms = checked_at;
+    credential.last_alive_ok = Some(verify.alive);
+    credential.last_alive_message = verify.message.clone();
+    if !verify.alive {
+        credential.status = ck::CredStatus::Expired;
+        credential.valid = false;
+        return Err(verify.message);
+    }
+
     {
         let mut creds = state.creds.lock().await;
-        creds.push(Credential {
-            name: if name.is_empty() {
-                "未命名".into()
-            } else {
-                name
-            },
-            cookie_str,
-            status: ck::CredStatus::Active,
-            valid: true,
-        });
+        creds.push(credential);
     }
     persist(&state, KV_CREDS, &*state.creds.lock().await);
     Ok(count)
@@ -716,6 +745,123 @@ async fn publish_order_log(app: &AppHandle, state: &AppState, msg: &str) {
         mirror_log_to_server(state, "info", msg).await;
     } else {
         relay_log(app, state, "info", msg).await;
+    }
+}
+
+fn ck_alive_spacing(count: usize) -> Duration {
+    if count <= 1 {
+        return Duration::ZERO;
+    }
+    let millis = CK_ALIVE_SPREAD_WINDOW.as_millis() as u64 / (count as u64 - 1);
+    Duration::from_millis(millis)
+}
+
+async fn due_ck_alive_indices(state: &AppState) -> Vec<usize> {
+    let now = now_ms();
+    state
+        .creds
+        .lock()
+        .await
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, c)| {
+            let elapsed = now.saturating_sub(c.last_alive_check_ms);
+            (c.last_alive_check_ms <= 0 || elapsed >= CK_ALIVE_MIN_INTERVAL_MS).then_some(idx)
+        })
+        .collect()
+}
+
+async fn verify_credential_alive_index(
+    app: &AppHandle,
+    state: &Arc<AppState>,
+    index: usize,
+    reason: &str,
+) {
+    let Some(ws) = state.ws.lock().await.as_ref().cloned() else {
+        return;
+    };
+    let Some(snapshot) = state.creds.lock().await.get(index).cloned() else {
+        return;
+    };
+    let now = now_ms();
+    if snapshot.last_alive_check_ms > 0
+        && now.saturating_sub(snapshot.last_alive_check_ms) < CK_ALIVE_MIN_INTERVAL_MS
+    {
+        return;
+    }
+
+    let result = ck_alive::verify(&ws, &state.notify_http, &snapshot, now).await;
+    let (ok, message) = match result {
+        Ok(r) => {
+            let mut creds = state.creds.lock().await;
+            let Some(slot) = creds.get_mut(index) else {
+                return;
+            };
+            if slot.name != snapshot.name || slot.cookie_str != snapshot.cookie_str {
+                return;
+            }
+            slot.last_alive_check_ms = now;
+            slot.last_alive_ok = Some(r.alive);
+            slot.last_alive_message = r.message.clone();
+            if r.alive {
+                if slot.status == ck::CredStatus::Expired {
+                    slot.status = ck::CredStatus::Active;
+                    slot.valid = true;
+                }
+            } else {
+                slot.status = ck::CredStatus::Expired;
+                slot.valid = false;
+            }
+            persist(state, KV_CREDS, &*creds);
+            (r.alive, r.message)
+        }
+        Err(e) => {
+            let mut creds = state.creds.lock().await;
+            let Some(slot) = creds.get_mut(index) else {
+                return;
+            };
+            if slot.name != snapshot.name || slot.cookie_str != snapshot.cookie_str {
+                return;
+            }
+            slot.last_alive_check_ms = now;
+            slot.last_alive_ok = None;
+            slot.last_alive_message = e.clone();
+            persist(state, KV_CREDS, &*creds);
+            emit(
+                app,
+                "log",
+                json!({"msg": format!("[CK验活] {reason}: {} 验证异常: {e}", snapshot.name)}),
+            );
+            return;
+        }
+    };
+
+    let level = if ok { "有效" } else { "失效" };
+    emit(
+        app,
+        "log",
+        json!({"msg": format!("[CK验活] {reason}: {} {level}({message})", snapshot.name)}),
+    );
+}
+
+async fn run_ck_alive_scheduler(app: AppHandle, state: Arc<AppState>) {
+    tokio::time::sleep(CK_ALIVE_SCAN_POLL).await;
+    loop {
+        if state.ws.lock().await.is_none() {
+            tokio::time::sleep(CK_ALIVE_SCAN_POLL).await;
+            continue;
+        }
+
+        let due = due_ck_alive_indices(&state).await;
+        let spacing = ck_alive_spacing(due.len());
+        for (pos, index) in due.into_iter().enumerate() {
+            if pos > 0 && !spacing.is_zero() {
+                tokio::time::sleep(spacing).await;
+            }
+            verify_credential_alive_index(&app, &state, index, "定时").await;
+        }
+
+        tokio::time::sleep(CK_ALIVE_SCAN_POLL).await;
     }
 }
 
@@ -1363,6 +1509,11 @@ pub fn run() {
             // 未显式改过地址时作为默认)。即使上面的 DB 打开失败也执行,保证部署方
             // 能通过运行目录文件配置地址。
             apply_runtime_config_file(&state);
+            let app_handle = app.handle().clone();
+            let state_for_alive = state.inner().clone();
+            tauri::async_runtime::spawn(async move {
+                run_ck_alive_scheduler(app_handle, state_for_alive).await;
+            });
             Ok(())
         })
         .run(tauri::generate_context!())
@@ -1378,6 +1529,9 @@ mod tests {
             name: name.to_string(),
             cookie_str: format!("pt_key={name}; pt_pin={name}; visitkey={name}"),
             status: ck::CredStatus::Active,
+            last_alive_check_ms: 0,
+            last_alive_ok: None,
+            last_alive_message: String::new(),
             valid: true,
         }
     }

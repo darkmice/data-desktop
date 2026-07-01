@@ -2,6 +2,7 @@
 //! testable independently of Tauri.
 
 pub mod access_token;
+pub mod ck_alive;
 pub mod ck;
 pub mod history;
 pub mod notify;

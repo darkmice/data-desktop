@@ -12,6 +12,7 @@ use tokio_tungstenite::Connector;
 use tungstenite::client::IntoClientRequest;
 use tungstenite::Message;
 
+use crate::core::ck_alive::{self, CkAliveSignature, RemoteCkAliveSigner};
 use crate::core::order::{SignResult, Signer, ORDER_CLIENT_PLATFORM};
 
 /// Events surfaced from the WS connection to the app layer.
@@ -159,6 +160,7 @@ impl WsClient {
                             let _ = tx.send(Ok(SignResult {
                                 h5st: v["h5st"].as_str().unwrap_or("").to_string(),
                                 device_uuid,
+                                request_params: v["request_params"].clone(),
                             }));
                         }
                     }
@@ -220,6 +222,32 @@ impl WsClient {
         self.out_tx
             .send(Message::Binary(framed))
             .map_err(|e| e.to_string())
+    }
+
+    async fn request_signature(&self, mut req: Value) -> Result<SignResult, String> {
+        let id = format!(
+            "s{}",
+            self.sign_seq
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        let (tx, rx) = oneshot::channel();
+        self.pending_sign.lock().await.insert(id.clone(), tx);
+
+        req["type"] = json!("sign");
+        req["id"] = json!(id);
+        if let Err(e) = self.send(req) {
+            self.pending_sign.lock().await.remove(&id);
+            return Err(e);
+        }
+
+        match tokio::time::timeout(std::time::Duration::from_secs(15), rx).await {
+            Ok(Ok(r)) => r,
+            Ok(Err(_)) => Err("sign channel closed".into()),
+            Err(_) => {
+                self.pending_sign.lock().await.remove(&id);
+                Err("sign timeout".into())
+            }
+        }
     }
 
     pub fn set_rules(&self, rules: &Value) -> Result<(), String> {
@@ -299,21 +327,11 @@ impl Signer for WsClient {
     }
 
     async fn sign(&self, function_id: &str, body_str: &str, t: i64) -> Result<SignResult, String> {
-        let id = format!(
-            "s{}",
-            self.sign_seq
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        );
-        let (tx, rx) = oneshot::channel();
-        self.pending_sign.lock().await.insert(id.clone(), tx);
-
         // 唯一一套签名 = 测试工具(h5st-probe)那套:sign_app_id 留空,服务端按
         // functionId 映射(getCurrentOrder→bd265 / submitOrder→cc85b),body 走 sha256
         // (raw_body=false)。曾经的第二套 paipai_h5(rdv6s/raw body)已废弃删除——
         // 服务端也强制规范化为这套,前端固定 codex。`t` 传入使 h5st 内层 t = 外层请求 t。
-        if let Err(e) = self.send(json!({
-            "type": "sign",
-            "id": id,
+        self.request_signature(json!({
             "function_id": function_id,
             "body": body_str,
             "appid": "m_core",
@@ -328,19 +346,45 @@ impl Signer for WsClient {
             "sign_app_id": "",
             "raw_body": false,
             "t": t,
-        })) {
-            self.pending_sign.lock().await.remove(&id);
-            return Err(e);
-        }
+        }))
+        .await
+    }
+}
 
-        match tokio::time::timeout(std::time::Duration::from_secs(15), rx).await {
-            Ok(Ok(r)) => r,
-            Ok(Err(_)) => Err("sign channel closed".into()),
-            Err(_) => {
-                self.pending_sign.lock().await.remove(&id);
-                Err("sign timeout".into())
-            }
-        }
+#[async_trait::async_trait]
+impl RemoteCkAliveSigner for WsClient {
+    async fn sign_ck_alive(&self, body_str: &str, t: i64) -> Result<CkAliveSignature, String> {
+        let signed = self
+            .request_signature(json!({
+                "function_id": ck_alive::FUNCTION_ID,
+                "body": body_str,
+                // The JD favorite-list recipe signs appid=m_core, but the final
+                // request sends appid=plus_business (see ck_alive::verify).
+                "appid": ck_alive::SIGN_APPID,
+                "sign_app_id": ck_alive::SIGN_APP_ID,
+                "raw_body": false,
+                "t": t,
+            }))
+            .await?;
+        let client = signed
+            .request_params
+            .get("client")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or("iPhone")
+            .to_string();
+        let client_version = signed
+            .request_params
+            .get("clientVersion")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or("3.0.7")
+            .to_string();
+        Ok(CkAliveSignature {
+            h5st: signed.h5st,
+            client,
+            client_version,
+        })
     }
 }
 

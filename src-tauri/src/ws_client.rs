@@ -12,7 +12,7 @@ use tokio_tungstenite::Connector;
 use tungstenite::client::IntoClientRequest;
 use tungstenite::Message;
 
-use crate::core::order::{Signer, ORDER_CLIENT_PLATFORM};
+use crate::core::order::{SignResult, Signer, ORDER_CLIENT_PLATFORM};
 
 /// Events surfaced from the WS connection to the app layer.
 #[derive(Debug, Clone)]
@@ -42,7 +42,10 @@ pub enum WsEvent {
     /// The server force-closed this connection (admin kick / IP ban / connection
     /// limit). `code` is "kicked"|"banned"|"conn_limit"; the socket closes right
     /// after. Surfaced distinctly so the UI can explain WHY the connection ended.
-    Kicked { code: String, message: String },
+    Kicked {
+        code: String,
+        message: String,
+    },
 }
 
 /// Handle to the live WS connection. Cloneable; sending is via an mpsc to the
@@ -50,7 +53,8 @@ pub enum WsEvent {
 #[derive(Clone)]
 pub struct WsClient {
     out_tx: mpsc::UnboundedSender<Message>,
-    pending: Arc<Mutex<HashMap<String, oneshot::Sender<Result<String, String>>>>>,
+    pending_sign: Arc<Mutex<HashMap<String, oneshot::Sender<Result<SignResult, String>>>>>,
+    pending_device: Arc<Mutex<HashMap<String, oneshot::Sender<Result<String, String>>>>>,
     sign_seq: Arc<std::sync::atomic::AtomicU64>,
     /// Master key for WS frame encryption (every business frame is AES-GCM
     /// encrypted to a binary frame; plaintext is rejected by the server).
@@ -86,7 +90,9 @@ impl WsClient {
         let (mut write, mut read) = ws.split();
 
         let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Message>();
-        let pending: Arc<Mutex<HashMap<String, oneshot::Sender<Result<String, String>>>>> =
+        let pending_sign: Arc<Mutex<HashMap<String, oneshot::Sender<Result<SignResult, String>>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let pending_device: Arc<Mutex<HashMap<String, oneshot::Sender<Result<String, String>>>>> =
             Arc::new(Mutex::new(HashMap::new()));
 
         // Writer task.
@@ -107,14 +113,17 @@ impl WsClient {
             .map_err(|e| e.to_string())?;
 
         // Reader task. 入站业务帧都是加密二进制;解密失败/明文一律跳过。
-        let pending_r = pending.clone();
+        let pending_sign_r = pending_sign.clone();
+        let pending_device_r = pending_device.clone();
         let ev = events.clone();
         let key_arc: Arc<[u8; 32]> = Arc::new(key);
         let key_r = key_arc.clone();
         tokio::spawn(async move {
             let _ = ev.send(WsEvent::Connected);
             while let Some(Ok(msg)) = read.next().await {
-                let Message::Binary(bytes) = msg else { continue };
+                let Message::Binary(bytes) = msg else {
+                    continue;
+                };
                 let v: Value = match crate::ws_frame::decode_server(&bytes, &key_r) {
                     Ok(v) => v,
                     Err(_) => continue,
@@ -142,14 +151,31 @@ impl WsClient {
                     }
                     "signed" => {
                         let id = v["id"].as_str().unwrap_or("").to_string();
-                        if let Some(tx) = pending_r.lock().await.remove(&id) {
-                            let _ = tx.send(Ok(v["h5st"].as_str().unwrap_or("").to_string()));
+                        if let Some(tx) = pending_sign_r.lock().await.remove(&id) {
+                            let device_uuid = v["device_uuid"]
+                                .as_str()
+                                .filter(|s| !s.trim().is_empty())
+                                .map(str::to_string);
+                            let _ = tx.send(Ok(SignResult {
+                                h5st: v["h5st"].as_str().unwrap_or("").to_string(),
+                                device_uuid,
+                            }));
+                        }
+                    }
+                    "signer_device" => {
+                        let id = v["id"].as_str().unwrap_or("").to_string();
+                        if let Some(tx) = pending_device_r.lock().await.remove(&id) {
+                            let _ =
+                                tx.send(Ok(v["device_uuid"].as_str().unwrap_or("").to_string()));
                         }
                     }
                     "sign_error" => {
                         let id = v["id"].as_str().unwrap_or("").to_string();
                         let msg = v["message"].as_str().unwrap_or("sign error").to_string();
-                        if let Some(tx) = pending_r.lock().await.remove(&id) {
+                        if let Some(tx) = pending_sign_r.lock().await.remove(&id) {
+                            let _ = tx.send(Err(msg.clone()));
+                        }
+                        if let Some(tx) = pending_device_r.lock().await.remove(&id) {
                             let _ = tx.send(Err(msg));
                         }
                     }
@@ -180,7 +206,8 @@ impl WsClient {
 
         Ok(Self {
             out_tx,
-            pending,
+            pending_sign,
+            pending_device,
             sign_seq: Arc::new(std::sync::atomic::AtomicU64::new(1)),
             key: key_arc,
         })
@@ -238,13 +265,43 @@ impl WsClient {
 
 #[async_trait::async_trait]
 impl Signer for WsClient {
-    async fn sign(&self, function_id: &str, body_str: &str, t: i64) -> Result<String, String> {
+    async fn signer_device_uuid(&self) -> Result<Option<String>, String> {
         let id = format!(
-            "s{}",
-            self.sign_seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            "d{}",
+            self.sign_seq
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         );
         let (tx, rx) = oneshot::channel();
-        self.pending.lock().await.insert(id.clone(), tx);
+        self.pending_device.lock().await.insert(id.clone(), tx);
+
+        if let Err(e) = self.send(json!({
+            "type": "signer_device",
+            "id": id,
+            "client": ORDER_CLIENT_PLATFORM,
+        })) {
+            self.pending_device.lock().await.remove(&id);
+            return Err(e);
+        }
+
+        match tokio::time::timeout(std::time::Duration::from_secs(20), rx).await {
+            Ok(Ok(Ok(device))) => Ok(Some(device)),
+            Ok(Ok(Err(e))) => Err(e),
+            Ok(Err(_)) => Err("signer device channel closed".into()),
+            Err(_) => {
+                self.pending_device.lock().await.remove(&id);
+                Err("signer device timeout".into())
+            }
+        }
+    }
+
+    async fn sign(&self, function_id: &str, body_str: &str, t: i64) -> Result<SignResult, String> {
+        let id = format!(
+            "s{}",
+            self.sign_seq
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        let (tx, rx) = oneshot::channel();
+        self.pending_sign.lock().await.insert(id.clone(), tx);
 
         // 唯一一套签名 = 测试工具(h5st-probe)那套:sign_app_id 留空,服务端按
         // functionId 映射(getCurrentOrder→bd265 / submitOrder→cc85b),body 走 sha256
@@ -268,7 +325,7 @@ impl Signer for WsClient {
             "raw_body": false,
             "t": t,
         })) {
-            self.pending.lock().await.remove(&id);
+            self.pending_sign.lock().await.remove(&id);
             return Err(e);
         }
 
@@ -276,7 +333,7 @@ impl Signer for WsClient {
             Ok(Ok(r)) => r,
             Ok(Err(_)) => Err("sign channel closed".into()),
             Err(_) => {
-                self.pending.lock().await.remove(&id);
+                self.pending_sign.lock().await.remove(&id);
                 Err("sign timeout".into())
             }
         }
@@ -314,6 +371,11 @@ impl rustls::client::danger::ServerCertVerifier for NoVerify {
     }
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
         use rustls::SignatureScheme::*;
-        vec![RSA_PKCS1_SHA256, ECDSA_NISTP256_SHA256, ED25519, RSA_PSS_SHA256]
+        vec![
+            RSA_PKCS1_SHA256,
+            ECDSA_NISTP256_SHA256,
+            ED25519,
+            RSA_PSS_SHA256,
+        ]
     }
 }

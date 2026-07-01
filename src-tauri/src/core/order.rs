@@ -34,6 +34,16 @@ pub struct OrderResult {
     pub youpin_sku_id: String,
 }
 
+/// Result of one remote h5st signing call.
+#[derive(Debug, Clone, Default)]
+pub struct SignResult {
+    pub h5st: String,
+    /// JD-planted device UUID from the signer page (`__jda` segment 2). This is
+    /// optional for older signers, but the probe order path uses it when the
+    /// pasted CK does not carry `visitkey`/`__jda`.
+    pub device_uuid: Option<String>,
+}
+
 impl OrderResult {
     fn fail(error: impl Into<String>) -> Self {
         Self {
@@ -54,12 +64,13 @@ impl OrderResult {
 /// recipe. Implemented by the Tauri layer against the live WS connection.
 #[async_trait::async_trait]
 pub trait Signer: Send + Sync {
-    async fn sign(
-        &self,
-        function_id: &str,
-        body_str: &str,
-        t: i64,
-    ) -> Result<String, String>;
+    /// Return the signer page's JD-planted device UUID when available. Default
+    /// signers (tests / legacy impls) may not expose it.
+    async fn signer_device_uuid(&self) -> Result<Option<String>, String> {
+        Ok(None)
+    }
+
+    async fn sign(&self, function_id: &str, body_str: &str, t: i64) -> Result<SignResult, String>;
 }
 
 /// Performs the actual HTTP POST to JD. Injected for testability.
@@ -87,7 +98,14 @@ fn needs_rotation(err: &str) -> bool {
     }
     // 只认明确的登录态失效信号(302=CK过期 / 未登录 / 登录失效 / 请先登录 / expired)。
     // 不含 "601"、不含过宽的 "invalid"(601 的 errorReason 可能含 invalid 误伤)。
-    const KW: &[&str] = &["302", "未登录", "登录失效", "请先登录", "expired", "no access"];
+    const KW: &[&str] = &[
+        "302",
+        "未登录",
+        "登录失效",
+        "请先登录",
+        "expired",
+        "no access",
+    ];
     KW.iter().any(|k| err.contains(k))
 }
 
@@ -153,11 +171,16 @@ fn build_sku_vo_list(b1: &Value, youpin_id: &str) -> Vec<Value> {
                     // category 是 [一级, 二级, 三级] 数组;缺失则 0。
                     let cat = sku["category"].as_array();
                     let cat_at = |i: usize| -> i64 {
-                        cat.and_then(|c| c.get(i)).and_then(|v| v.as_i64()).unwrap_or(0)
+                        cat.and_then(|c| c.get(i))
+                            .and_then(|v| v.as_i64())
+                            .unwrap_or(0)
                     };
                     // skuId 优先取数字,回退字符串解析;jdPrice 统一成字符串。
                     let sku_id = sku["skuId"].as_i64().unwrap_or_else(|| {
-                        sku["skuId"].as_str().and_then(|s| s.parse().ok()).unwrap_or(0)
+                        sku["skuId"]
+                            .as_str()
+                            .and_then(|s| s.parse().ok())
+                            .unwrap_or(0)
                     });
                     let jd_price = match &sku["jdPrice"] {
                         Value::String(s) => s.clone(),
@@ -193,91 +216,97 @@ fn build_ds_list(device_uuid: &str, youpin_id: &str, now_ms: i64) -> Vec<Value> 
     let pprd_s = format!("122270672.{device_uuid}.{now_s}.{now_s}.{}.2", now_s - 120);
     let ext17 = format!("122270672%7Cdirect%7C-%7Cnone%7C-%7C{device_uuid}");
     // fpa:取 deviceUUID 切片拼接(与 h5st-probe 一致,第5段取 16..28 共12位)。
-    let uuid_seg = |a: usize, b: usize| -> &str {
-        device_uuid.get(a..b.min(device_uuid.len())).unwrap_or("")
-    };
+    let uuid_seg =
+        |a: usize, b: usize| -> &str { device_uuid.get(a..b.min(device_uuid.len())).unwrap_or("") };
     let fpa = format!(
         "{}-{}-b14a-3b22-{}-{}",
-        uuid_seg(0, 8), uuid_seg(8, 12), uuid_seg(16, 28), now_s
+        uuid_seg(0, 8),
+        uuid_seg(8, 12),
+        uuid_seg(16, 28),
+        now_s
     );
 
     // (paramName, Option<paramVal>)。None 表示该项只有 paramName、无 paramVal 字段。
-    let items: &[(&str, Option<String>)] = &[
-        ("report_time", Some(String::new())),
-        ("deal_id", Some(String::new())),
-        ("buyer_uin", None),
-        ("pin", Some(String::new())),
-        ("cookie_pprd_p", Some(pprd_p)),
-        ("cookie_pprd_s", Some(pprd_s)),
-        ("cookie_pprd_t", None),
-        ("ip", Some(String::new())),
-        ("visitkey", Some(device_uuid.to_string())),
-        ("gen_entrance", Some(String::new())),
-        ("deal_src", Some("7".into())),
-        ("item_type", Some("1".into())),
-        ("fav_unixtime", Some(String::new())),
-        ("pay_type", Some("0".into())),
-        ("ab_test", Some(String::new())),
-        ("serilize_type", Some("0".into())),
-        ("property1", Some("0".into())),
-        ("property2", Some("0".into())),
-        ("property3", Some("0".into())),
-        ("property4", Some("0".into())),
-        ("seller_uin", Some("0".into())),
-        ("pp_item_id", Some(String::new())),
-        ("openid", None),
-        ("orderprice", Some(String::new())),
-        ("actiontype", Some(String::new())),
-        ("extinfo", Some(String::new())),
-        ("ext1", Some(youpin_id.to_string())),
-        ("ext2", Some(String::new())),
-        ("ext3", Some(String::new())),
-        ("ext4", Some(String::new())),
-        ("ext5", Some(String::new())),
-        ("ext6", None),
-        ("ext7", Some(String::new())),
-        ("ext8", Some("0".into())),
-        ("ext9", Some("0|0|0|0|0||0|0".into())),
-        ("ext10", Some("|||".into())),
-        ("ext11", Some("http://wq.jd.com/wxapp/pages/pay/index/index".into())),
-        ("ext12", Some("1".into())),
-        ("ext13", Some(String::new())),
-        ("ext14", Some(String::new())),
-        ("ext15", Some(String::new())),
-        ("ext16", Some(String::new())),
-        ("ext17", Some(ext17)),
-        ("ext18", None),
-        ("ext19", Some(String::new())),
-        ("ext20", None),
-        ("fpa", Some(fpa)),
-        // fpb:对齐 h5st-probe 的完整指纹串(deviceUUID 切片 + 固定长尾)。
-        (
-            "fpb",
-            Some(format!(
+    let items: &[(&str, Option<String>)] =
+        &[
+            ("report_time", Some(String::new())),
+            ("deal_id", Some(String::new())),
+            ("buyer_uin", None),
+            ("pin", Some(String::new())),
+            ("cookie_pprd_p", Some(pprd_p)),
+            ("cookie_pprd_s", Some(pprd_s)),
+            ("cookie_pprd_t", None),
+            ("ip", Some(String::new())),
+            ("visitkey", Some(device_uuid.to_string())),
+            ("gen_entrance", Some(String::new())),
+            ("deal_src", Some("7".into())),
+            ("item_type", Some("1".into())),
+            ("fav_unixtime", Some(String::new())),
+            ("pay_type", Some("0".into())),
+            ("ab_test", Some(String::new())),
+            ("serilize_type", Some("0".into())),
+            ("property1", Some("0".into())),
+            ("property2", Some("0".into())),
+            ("property3", Some("0".into())),
+            ("property4", Some("0".into())),
+            ("seller_uin", Some("0".into())),
+            ("pp_item_id", Some(String::new())),
+            ("openid", None),
+            ("orderprice", Some(String::new())),
+            ("actiontype", Some(String::new())),
+            ("extinfo", Some(String::new())),
+            ("ext1", Some(youpin_id.to_string())),
+            ("ext2", Some(String::new())),
+            ("ext3", Some(String::new())),
+            ("ext4", Some(String::new())),
+            ("ext5", Some(String::new())),
+            ("ext6", None),
+            ("ext7", Some(String::new())),
+            ("ext8", Some("0".into())),
+            ("ext9", Some("0|0|0|0|0||0|0".into())),
+            ("ext10", Some("|||".into())),
+            (
+                "ext11",
+                Some("http://wq.jd.com/wxapp/pages/pay/index/index".into()),
+            ),
+            ("ext12", Some("1".into())),
+            ("ext13", Some(String::new())),
+            ("ext14", Some(String::new())),
+            ("ext15", Some(String::new())),
+            ("ext16", Some(String::new())),
+            ("ext17", Some(ext17)),
+            ("ext18", None),
+            ("ext19", Some(String::new())),
+            ("ext20", None),
+            ("fpa", Some(fpa)),
+            // fpb:对齐 h5st-probe 的完整指纹串(deviceUUID 切片 + 固定长尾)。
+            (
+                "fpb",
+                Some(format!(
                 "BApXW{}-{}-{}_{}{}-BsBoM6po9xJ1O81KL9CAwE291aU5aIwTENsOtaXXi8Bsd7pk46sM52DtUxE",
                 uuid_seg(0, 4), uuid_seg(4, 8), uuid_seg(8, 12), uuid_seg(12, 16), uuid_seg(16, 20)
             )),
-        ),
-        ("ext21", Some(String::new())),
-        ("ext22", Some(String::new())),
-        ("ext23", Some("NULL".into())),
-        ("ext24", Some("NULL".into())),
-        ("ext25", Some("NULL".into())),
-        ("ext26", Some("NULL".into())),
-        ("ext27", Some("NULL".into())),
-        ("ext28", Some("NULL".into())),
-        ("ext29", Some("NULL".into())),
-        ("ext30", Some("NULL".into())),
-        ("ext31", Some("NULL".into())),
-        ("ext32", Some("NULL".into())),
-        ("ext33", Some("NULL".into())),
-        ("ext34", Some("NULL".into())),
-        ("ext35", Some("NULL".into())),
-        ("ext36", Some("NULL".into())),
-        ("ext37", Some("NULL".into())),
-        ("ext38", Some("NULL".into())),
-        ("dt", Some(String::new())),
-    ];
+            ),
+            ("ext21", Some(String::new())),
+            ("ext22", Some(String::new())),
+            ("ext23", Some("NULL".into())),
+            ("ext24", Some("NULL".into())),
+            ("ext25", Some("NULL".into())),
+            ("ext26", Some("NULL".into())),
+            ("ext27", Some("NULL".into())),
+            ("ext28", Some("NULL".into())),
+            ("ext29", Some("NULL".into())),
+            ("ext30", Some("NULL".into())),
+            ("ext31", Some("NULL".into())),
+            ("ext32", Some("NULL".into())),
+            ("ext33", Some("NULL".into())),
+            ("ext34", Some("NULL".into())),
+            ("ext35", Some("NULL".into())),
+            ("ext36", Some("NULL".into())),
+            ("ext37", Some("NULL".into())),
+            ("ext38", Some("NULL".into())),
+            ("dt", Some(String::new())),
+        ];
     items
         .iter()
         .map(|(name, val)| match val {
@@ -313,7 +342,13 @@ fn build_submit_body(
                 _ => String::new(),
             }
         };
-        format!("{}-{}-{}-{}", s("provinceId"), s("cityId"), s("countyId"), s("id"))
+        format!(
+            "{}-{}-{}-{}",
+            s("provinceId"),
+            s("cityId"),
+            s("countyId"),
+            s("id")
+        )
     } else if !rp.location_id.is_empty() {
         rp.location_id.clone()
     } else {
@@ -513,9 +548,10 @@ async fn run_step<S: Signer, H: OrderHttp>(
     now_ms: i64,
 ) -> Result<Value, String> {
     let body_str = serde_json::to_string(body).map_err(|e| e.to_string())?;
-    let h5st = signer.sign(function_id, &body_str, now_ms).await?;
-    let params = build_params(function_id, &body_str, youpin_id, &h5st, now_ms, rp);
-    http.post_client_action(&params, cookie_header, youpin_id).await
+    let signed = signer.sign(function_id, &body_str, now_ms).await?;
+    let params = build_params(function_id, &body_str, youpin_id, &signed.h5st, now_ms, rp);
+    http.post_client_action(&params, cookie_header, youpin_id)
+        .await
 }
 
 /// Wall-clock unix millis. JD validates that the request `t` is close to server
@@ -564,9 +600,25 @@ async fn order_once_inner<S: Signer, H: OrderHttp>(
     // Step 1: getCurrentOrder → address id + price. Fresh t.
     let now1 = fresh_ms(now_ms_test);
     let body1 = build_body(inspect_id, youpin_id, None, &rp);
-    let r1 = match run_step(signer, http, "balance_getCurrentOrder_m", &body1, youpin_id, &header, &rp, now1).await {
+    let r1 = match run_step(
+        signer,
+        http,
+        "balance_getCurrentOrder_m",
+        &body1,
+        youpin_id,
+        &header,
+        &rp,
+        now1,
+    )
+    .await
+    {
         Ok(v) => v,
-        Err(e) => return OrderResult { credential: cred.name.clone(), ..OrderResult::fail(e) },
+        Err(e) => {
+            return OrderResult {
+                credential: cred.name.clone(),
+                ..OrderResult::fail(e)
+            }
+        }
     };
     let b1 = &r1["body"];
     if b1["errorCode"].as_str() == Some("601") {
@@ -577,9 +629,16 @@ async fn order_once_inner<S: Signer, H: OrderHttp>(
             r1["code"].as_str().unwrap_or(&r1["code"].to_string()),
             r1["message"].as_str().unwrap_or(""),
             b1["errorReason"].as_str().unwrap_or(""),
-            serde_json::to_string(&r1).unwrap_or_default().chars().take(400).collect::<String>(),
+            serde_json::to_string(&r1)
+                .unwrap_or_default()
+                .chars()
+                .take(400)
+                .collect::<String>(),
         );
-        return OrderResult { credential: cred.name.clone(), ..OrderResult::fail(diag) };
+        return OrderResult {
+            credential: cred.name.clone(),
+            ..OrderResult::fail(diag)
+        };
     }
     // 地址 ID 可能是字符串或数字(真实返回是数字,如 13017040608),两种都接受。
     let addr_val = |v: &Value| -> Option<String> {
@@ -604,7 +663,10 @@ async fn order_once_inner<S: Signer, H: OrderHttp>(
             } else {
                 "未获取到地址(可能售罄或不可购买)".to_string()
             };
-            return OrderResult { credential: cred.name.clone(), ..OrderResult::fail(msg) };
+            return OrderResult {
+                credential: cred.name.clone(),
+                ..OrderResult::fail(msg)
+            };
         }
     };
     let price = b1["balanceTotal"]["factPrice"].to_string();
@@ -612,11 +674,32 @@ async fn order_once_inner<S: Signer, H: OrderHttp>(
     // Step 2: submitOrder. Fresh t again (or pinned test value + 1). 用 Step1 返回
     // 数据(b1)重建完整 submitOrder body —— balanceId / transferDataStr / skuVOList /
     // dsList / balanceExt / actualPayment 等会话凭据缺一不可,否则订单会话对不上必失败。
-    let now2 = if now_ms_test > 0 { now_ms_test + 1 } else { fresh_ms(0) };
+    let now2 = if now_ms_test > 0 {
+        now_ms_test + 1
+    } else {
+        fresh_ms(0)
+    };
     let body2 = build_submit_body(b1, inspect_id, youpin_id, &addr, &rp, now2);
-    let r2 = match run_step(signer, http, "balance_submitOrder_m", &body2, youpin_id, &header, &rp, now2).await {
+    let r2 = match run_step(
+        signer,
+        http,
+        "balance_submitOrder_m",
+        &body2,
+        youpin_id,
+        &header,
+        &rp,
+        now2,
+    )
+    .await
+    {
         Ok(v) => v,
-        Err(e) => return OrderResult { credential: cred.name.clone(), price, ..OrderResult::fail(e) },
+        Err(e) => {
+            return OrderResult {
+                credential: cred.name.clone(),
+                price,
+                ..OrderResult::fail(e)
+            }
+        }
     };
     let b2 = &r2["body"];
     let order_id = b2["order"]["orderId"].as_str().unwrap_or("").to_string();
@@ -630,8 +713,15 @@ async fn order_once_inner<S: Signer, H: OrderHttp>(
             ..Default::default()
         }
     } else {
-        let err = b2["errorReason"].as_str().or(b2["errorCode"].as_str()).unwrap_or("未知错误");
-        OrderResult { credential: cred.name.clone(), price, ..OrderResult::fail(err) }
+        let err = b2["errorReason"]
+            .as_str()
+            .or(b2["errorCode"].as_str())
+            .unwrap_or("未知错误");
+        OrderResult {
+            credential: cred.name.clone(),
+            price,
+            ..OrderResult::fail(err)
+        }
     }
 }
 
@@ -680,7 +770,10 @@ pub async fn order_with_rotation<S: Signer, H: OrderHttp>(
             if n == 1 || tried >= n || !creds.iter().any(|c| c.is_active()) {
                 logs.push("所有凭证均不可用，请更新凭证".into());
                 return (
-                    OrderResult { error: format!("所有凭证均不可用: {}", res.error), ..res },
+                    OrderResult {
+                        error: format!("所有凭证均不可用: {}", res.error),
+                        ..res
+                    },
                     creds,
                     idx,
                 );
@@ -743,7 +836,10 @@ pub async fn order_with_rotation_probe<S: Signer>(
             tried += 1;
             if n == 1 || tried >= n || !creds.iter().any(|c| c.is_active()) {
                 logs.push("所有凭证均不可用，请更新凭证".into());
-                break OrderResult { error: format!("所有凭证均不可用: {}", res.error), ..res };
+                break OrderResult {
+                    error: format!("所有凭证均不可用: {}", res.error),
+                    ..res
+                };
             }
             logs.push(format!("凭证 {} 已失效，自动切换", creds[idx].name));
             idx = (idx + 1) % n;
@@ -771,18 +867,36 @@ async fn order_once_probe<S: Signer>(
 
     let cookies = ck::parse_cookies(&cred.cookie_str);
     let rp = ck::extract_real_params(&cookies);
-    let device = rp.device_uuid.clone();
+    let device = match resolve_probe_device_uuid(signer, &rp).await {
+        Ok(device) => device,
+        Err(e) => {
+            return OrderResult {
+                credential: cred.name.clone(),
+                ..OrderResult::fail(e)
+            }
+        }
+    };
     let ck_str = cred.cookie_str.as_str();
 
     // ===== Step1: getCurrentOrder(probe body + WS 签名 + probe send)=====
     let body1 = pbody::build_get_current_order_body(&device, youpin_id, inspect_id);
     let signed1 = match sign_via_ws(signer, "balance_getCurrentOrder_m", &body1).await {
         Ok(s) => s,
-        Err(e) => return OrderResult { credential: cred.name.clone(), ..OrderResult::fail(e) },
+        Err(e) => {
+            return OrderResult {
+                credential: cred.name.clone(),
+                ..OrderResult::fail(e)
+            }
+        }
     };
     let r1 = match psend::call(&signed1, ck_str, youpin_id).await {
         Ok(r) => r,
-        Err(e) => return OrderResult { credential: cred.name.clone(), ..OrderResult::fail(format!("Step1 发请求失败: {e}")) },
+        Err(e) => {
+            return OrderResult {
+                credential: cred.name.clone(),
+                ..OrderResult::fail(format!("Step1 发请求失败: {e}"))
+            }
+        }
     };
     if !r1.is_ok() {
         let msg = if r1.error_reason.is_empty() {
@@ -790,7 +904,10 @@ async fn order_once_probe<S: Signer>(
         } else {
             r1.error_reason.clone()
         };
-        return OrderResult { credential: cred.name.clone(), ..OrderResult::fail(msg) };
+        return OrderResult {
+            credential: cred.name.clone(),
+            ..OrderResult::fail(msg)
+        };
     }
     let b1 = r1.body().clone();
     let price = b1["balanceTotal"]["factPrice"].to_string();
@@ -802,11 +919,18 @@ async fn order_once_probe<S: Signer>(
     // ===== Step2: submitOrder(probe body + WS 签名 + probe send)+ 过快重试一次 =====
     let mut r2 = match submit_once_probe(signer, &body2, ck_str, youpin_id).await {
         Ok(r) => r,
-        Err(e) => return OrderResult { credential: cred.name.clone(), price, ..OrderResult::fail(e) },
+        Err(e) => {
+            return OrderResult {
+                credential: cred.name.clone(),
+                price,
+                ..OrderResult::fail(e)
+            }
+        }
     };
     if order_too_fast(&r2) {
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-        let body2_retry = pbody::build_submit_order_body(&b1, &device, youpin_id, inspect_id, now_unix_ms());
+        let body2_retry =
+            pbody::build_submit_order_body(&b1, &device, youpin_id, inspect_id, now_unix_ms());
         if let Ok(r) = submit_once_probe(signer, &body2_retry, ck_str, youpin_id).await {
             r2 = r;
         }
@@ -818,7 +942,11 @@ async fn order_once_probe<S: Signer>(
         OrderResult {
             success: true,
             order_id,
-            price: if op.is_empty() || op == "null" { price } else { op },
+            price: if op.is_empty() || op == "null" {
+                price
+            } else {
+                op
+            },
             credential: cred.name.clone(),
             ..Default::default()
         }
@@ -828,8 +956,40 @@ async fn order_once_probe<S: Signer>(
         } else {
             format!("未拿到 orderId: {}", r2.raw_snippet)
         };
-        OrderResult { credential: cred.name.clone(), price, ..OrderResult::fail(err) }
+        OrderResult {
+            credential: cred.name.clone(),
+            price,
+            ..OrderResult::fail(err)
+        }
     }
+}
+
+fn usable_device_uuid(s: &str) -> bool {
+    let s = s.trim();
+    !s.is_empty() && s != "0"
+}
+
+/// h5st-probe 的成功链路不依赖 CK 里的 `__jda`;它使用签名 session 自己被 JD 种下的
+/// `__jda` 第 2 段作为 deviceUUID。客户端也优先走这个来源;旧服务端不支持时再退回
+/// CK 的 visitkey/__jda,避免继续把 `"0"` 写进 Step1/Step2 body。
+async fn resolve_probe_device_uuid<S: Signer>(
+    signer: &S,
+    rp: &RealParams,
+) -> Result<String, String> {
+    let signer_err = match signer.signer_device_uuid().await {
+        Ok(Some(device)) if usable_device_uuid(&device) => return Ok(device),
+        Ok(_) => None,
+        Err(e) => Some(e),
+    };
+    if usable_device_uuid(&rp.device_uuid) {
+        return Ok(rp.device_uuid.clone());
+    }
+    if let Some(e) = signer_err {
+        return Err(format!(
+            "签名会话未返回 deviceUUID({e}),且 CK 不含 visitkey/__jda,无法按 probe 链路下单"
+        ));
+    }
+    Err("签名会话未返回 deviceUUID,且 CK 不含 visitkey/__jda,无法按 probe 链路下单".into())
 }
 
 /// 通过 WS 签名,把结果拼成 probe 的 [`h5st_probe::send::Signed`],供 probe send 使用。
@@ -841,7 +1001,8 @@ async fn sign_via_ws<S: Signer>(
     // body 必须按插入序序列化(serde preserve_order),与签名时哈希的 body 同串。
     let body_str = serde_json::to_string(body).map_err(|e| e.to_string())?;
     let t = now_unix_ms() as i64;
-    let h5st = signer.sign(function_id, &body_str, t).await?;
+    let signed = signer.sign(function_id, &body_str, t).await?;
+    let h5st = signed.h5st;
     // 从 h5st 取第7段当 req_t(与内层 t 一致);取不到则用 t。
     let req_t = h5st
         .split(';')
@@ -849,7 +1010,13 @@ async fn sign_via_ws<S: Signer>(
         .filter(|s| s.chars().all(|c| c.is_ascii_digit()) && !s.is_empty())
         .map(|s| s.to_string())
         .unwrap_or_else(|| t.to_string());
-    let seg3 = h5st.split(';').nth(3).unwrap_or("").chars().take(8).collect();
+    let seg3 = h5st
+        .split(';')
+        .nth(3)
+        .unwrap_or("")
+        .chars()
+        .take(8)
+        .collect();
     Ok(h5st_probe::send::Signed {
         function_id: function_id.to_string(),
         h5st,
@@ -898,7 +1065,10 @@ fn order_too_fast(r: &h5st_probe::send::CallResult) -> bool {
 
 fn now_unix_ms() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// Build the dingtalk product link (spec §6.1).
@@ -955,7 +1125,11 @@ impl OrderHttp for WreqHttp {
                 h.insert(HeaderName::from_static(k), val);
             }
         };
-        set(&mut headers, "content-type", "application/x-www-form-urlencoded");
+        set(
+            &mut headers,
+            "content-type",
+            "application/x-www-form-urlencoded",
+        );
         set(&mut headers, "origin", "https://item.m.jd.com");
         set(&mut headers, "user-agent", ORDER_UA);
         set(&mut headers, "referer", &referer);
@@ -983,8 +1157,41 @@ mod tests {
     struct FakeSigner;
     #[async_trait::async_trait]
     impl Signer for FakeSigner {
-        async fn sign(&self, _f: &str, _b: &str, _t: i64) -> Result<String, String> {
-            Ok("fakeh5st".into())
+        async fn sign(&self, _f: &str, _b: &str, _t: i64) -> Result<SignResult, String> {
+            Ok(SignResult {
+                h5st: "fakeh5st".into(),
+                device_uuid: None,
+            })
+        }
+    }
+
+    struct DeviceSigner(&'static str);
+    #[async_trait::async_trait]
+    impl Signer for DeviceSigner {
+        async fn signer_device_uuid(&self) -> Result<Option<String>, String> {
+            Ok(Some(self.0.to_string()))
+        }
+
+        async fn sign(&self, _f: &str, _b: &str, _t: i64) -> Result<SignResult, String> {
+            Ok(SignResult {
+                h5st: "fakeh5st".into(),
+                device_uuid: Some(self.0.to_string()),
+            })
+        }
+    }
+
+    struct DeviceErrorSigner;
+    #[async_trait::async_trait]
+    impl Signer for DeviceErrorSigner {
+        async fn signer_device_uuid(&self) -> Result<Option<String>, String> {
+            Err("signer device timeout".into())
+        }
+
+        async fn sign(&self, _f: &str, _b: &str, _t: i64) -> Result<SignResult, String> {
+            Ok(SignResult {
+                h5st: "fakeh5st".into(),
+                device_uuid: None,
+            })
         }
     }
 
@@ -992,10 +1199,21 @@ mod tests {
     struct OkHttp;
     #[async_trait::async_trait]
     impl OrderHttp for OkHttp {
-        async fn post_client_action(&self, params: &[(String, String)], _c: &str, _y: &str) -> Result<Value, String> {
-            let fid = params.iter().find(|(k, _)| k == "functionId").map(|(_, v)| v.clone()).unwrap_or_default();
+        async fn post_client_action(
+            &self,
+            params: &[(String, String)],
+            _c: &str,
+            _y: &str,
+        ) -> Result<Value, String> {
+            let fid = params
+                .iter()
+                .find(|(k, _)| k == "functionId")
+                .map(|(_, v)| v.clone())
+                .unwrap_or_default();
             if fid.contains("getCurrentOrder") {
-                Ok(json!({"body":{"balanceAddress":{"id":"8042010864"},"balanceTotal":{"factPrice":8711.13}}}))
+                Ok(
+                    json!({"body":{"balanceAddress":{"id":"8042010864"},"balanceTotal":{"factPrice":8711.13}}}),
+                )
             } else {
                 Ok(json!({"body":{"order":{"orderId":"ORDER123","orderPrice":8711.13}}}))
             }
@@ -1006,18 +1224,26 @@ mod tests {
     struct RiskHttp;
     #[async_trait::async_trait]
     impl OrderHttp for RiskHttp {
-        async fn post_client_action(&self, _p: &[(String, String)], _c: &str, _y: &str) -> Result<Value, String> {
+        async fn post_client_action(
+            &self,
+            _p: &[(String, String)],
+            _c: &str,
+            _y: &str,
+        ) -> Result<Value, String> {
             Ok(json!({"body":{"errorCode":"601"}}))
         }
     }
 
     fn creds(names: &[&str]) -> Vec<Credential> {
-        names.iter().map(|n| Credential {
-            name: n.to_string(),
-            cookie_str: "pt_key=x; visitkey=v".into(),
-            status: ck::CredStatus::Active,
-            valid: true,
-        }).collect()
+        names
+            .iter()
+            .map(|n| Credential {
+                name: n.to_string(),
+                cookie_str: "pt_key=x; visitkey=v".into(),
+                status: ck::CredStatus::Active,
+                valid: true,
+            })
+            .collect()
     }
 
     /// 一个贴近真实的 Step1 `body` 返回(含会话凭据 + SKU 详情 + 地址)。
@@ -1057,11 +1283,21 @@ mod tests {
             location_id: String::new(),
             eid_token: String::new(),
         };
-        let body = build_submit_body(&b1, "123736024424448", "100264461867", "13017040608", &rp, 1_782_308_729_987);
+        let body = build_submit_body(
+            &b1,
+            "123736024424448",
+            "100264461867",
+            "13017040608",
+            &rp,
+            1_782_308_729_987,
+        );
 
         // 会话凭据必须取自 Step1(缺则订单会话对不上)。
         assert_eq!(body["balanceId"], "6628841741352017921782308729906");
-        assert_eq!(body["balanceTransferDataStr"], "{\"sessionId\":\"aaec04de\",\"reqSkuMap\":{}}");
+        assert_eq!(
+            body["balanceTransferDataStr"],
+            "{\"sessionId\":\"aaec04de\",\"reqSkuMap\":{}}"
+        );
         assert_eq!(body["actualPayment"], "1087.02");
         assert_eq!(body["mainSkuIdList"][0], 100264461867i64);
 
@@ -1092,9 +1328,15 @@ mod tests {
         // addressId 已从 balanceCommonOrderForm 移除(对齐文档);地址走顶层 locationId。
         assert!(body["balanceCommonOrderForm"]["addressId"].is_null());
         // inspectSkuId 填 inspect_id 本身(不是 youpin)——对齐文档。
-        assert_eq!(body["balanceCommonOrderForm"]["inspectSkuId"], "123736024424448");
+        assert_eq!(
+            body["balanceCommonOrderForm"]["inspectSkuId"],
+            "123736024424448"
+        );
         assert_eq!(body["balanceCommonOrderForm"]["appVersion"], "3.0.8");
-        assert_eq!(body["balanceExt"]["supportPaymentSkuList"][0], "100264461867");
+        assert_eq!(
+            body["balanceExt"]["supportPaymentSkuList"][0],
+            "100264461867"
+        );
         assert_eq!(body["balanceExt"]["subsidyPriceText"], "超级补贴");
         // 文档新增:国补提示文案 + creditEmptyImg CDN URL。
         assert_eq!(
@@ -1122,8 +1364,10 @@ mod tests {
         // Step1 返回稀疏(无 vendor list / 无地址)时不 panic,skuVOList 退化为 [{}]。
         let b1 = json!({"balanceTotal": {"factPrice": 50.0}});
         let rp = RealParams {
-            device_uuid: "u".into(), address_id: String::new(),
-            location_id: "1-72-2819-0".into(), eid_token: String::new(),
+            device_uuid: "u".into(),
+            address_id: String::new(),
+            location_id: "1-72-2819-0".into(),
+            eid_token: String::new(),
         };
         let body = build_submit_body(&b1, "i", "y", "addr1", &rp, 1000);
         assert_eq!(body["balanceDataServerSkuVOList"][0], json!({}));
@@ -1139,6 +1383,46 @@ mod tests {
         assert_eq!(r.order_id, "ORDER123");
     }
 
+    #[tokio::test]
+    async fn probe_device_prefers_signer_session_over_ck_fallback() {
+        let rp = RealParams {
+            device_uuid: "0".into(),
+            address_id: String::new(),
+            location_id: String::new(),
+            eid_token: String::new(),
+        };
+        let device = resolve_probe_device_uuid(&DeviceSigner("signer-dev-123"), &rp)
+            .await
+            .unwrap();
+        assert_eq!(device, "signer-dev-123");
+    }
+
+    #[tokio::test]
+    async fn probe_device_falls_back_to_ck_when_signer_missing() {
+        let rp = RealParams {
+            device_uuid: "ck-dev-456".into(),
+            address_id: String::new(),
+            location_id: String::new(),
+            eid_token: String::new(),
+        };
+        let device = resolve_probe_device_uuid(&FakeSigner, &rp).await.unwrap();
+        assert_eq!(device, "ck-dev-456");
+    }
+
+    #[tokio::test]
+    async fn probe_device_falls_back_to_ck_when_signer_errors() {
+        let rp = RealParams {
+            device_uuid: "ck-dev-789".into(),
+            address_id: String::new(),
+            location_id: String::new(),
+            eid_token: String::new(),
+        };
+        let device = resolve_probe_device_uuid(&DeviceErrorSigner, &rp)
+            .await
+            .unwrap();
+        assert_eq!(device, "ck-dev-789");
+    }
+
     /// 601 = 风控(间歇性),不是凭证失效:必须【不轮换、不禁用凭证】,失败返回但
     /// 凭证保持 valid,这样用户可以用同一把 CK 慢点重试。回归防护:之前的 bug 是
     /// 601 触发 needs_rotation → valid=false → 之后下单跳过该凭证(连签名都不发)。
@@ -1146,16 +1430,33 @@ mod tests {
     async fn risk_601_does_not_disable_credential() {
         let mut logs = Vec::new();
         let (r, updated, _) = order_with_rotation(
-            &FakeSigner, &RiskHttp, creds(&["a", "b"]), 0, "i1", "y1", 1000,
+            &FakeSigner,
+            &RiskHttp,
+            creds(&["a", "b"]),
+            0,
+            "i1",
+            "y1",
+            1000,
             &mut logs,
-        ).await;
+        )
+        .await;
         assert!(!r.success);
         assert!(r.error.contains("601"));
         // 关键:命中的凭证标为风控态(前端橙色)但仍可用(is_active 仅 Expired 才 false),
         // 不发生轮换切换。第一把(idx 0)被标 RiskControlled,但 status!=Expired → 下次仍会用。
-        assert_eq!(updated[0].status, ck::CredStatus::RiskControlled, "601 标风控态");
-        assert!(updated.iter().all(|c| c.status != ck::CredStatus::Expired), "601 不应标过期");
-        assert!(!logs.iter().any(|l| l.contains("自动切换")), "601 不应触发轮换");
+        assert_eq!(
+            updated[0].status,
+            ck::CredStatus::RiskControlled,
+            "601 标风控态"
+        );
+        assert!(
+            updated.iter().all(|c| c.status != ck::CredStatus::Expired),
+            "601 不应标过期"
+        );
+        assert!(
+            !logs.iter().any(|l| l.contains("自动切换")),
+            "601 不应触发轮换"
+        );
     }
 
     /// 真正的登录态失效(302/未登录)才轮换:第一把失效后切到下一把。
@@ -1164,18 +1465,33 @@ mod tests {
         struct ExpiredHttp;
         #[async_trait::async_trait]
         impl OrderHttp for ExpiredHttp {
-            async fn post_client_action(&self, _p: &[(String, String)], _c: &str, _y: &str) -> Result<Value, String> {
+            async fn post_client_action(
+                &self,
+                _p: &[(String, String)],
+                _c: &str,
+                _y: &str,
+            ) -> Result<Value, String> {
                 Ok(json!({"body":{"errorCode":"302","errorReason":"no access"}}))
             }
         }
         let mut logs = Vec::new();
         let (r, updated, _) = order_with_rotation(
-            &FakeSigner, &ExpiredHttp, creds(&["a", "b"]), 0, "i1", "y1", 1000,
+            &FakeSigner,
+            &ExpiredHttp,
+            creds(&["a", "b"]),
+            0,
+            "i1",
+            "y1",
+            1000,
             &mut logs,
-        ).await;
+        )
+        .await;
         assert!(!r.success);
         // 两把都 302 → 都标 Expired → 最终"所有凭证均不可用"。
-        assert!(updated.iter().all(|c| c.status == ck::CredStatus::Expired), "302 应标过期");
+        assert!(
+            updated.iter().all(|c| c.status == ck::CredStatus::Expired),
+            "302 应标过期"
+        );
     }
 
     #[test]
@@ -1197,11 +1513,21 @@ mod tests {
             location_id: String::new(),
             eid_token: "EIDTOK".into(),
         };
-        let p = build_params("balance_getCurrentOrder_m", "{}", "100358632432", "H5ST", 1782364563948, &rp);
+        let p = build_params(
+            "balance_getCurrentOrder_m",
+            "{}",
+            "100358632432",
+            "H5ST",
+            1782364563948,
+            &rp,
+        );
         let get = |k: &str| p.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
         // 必含的 10 项。
         assert_eq!(get("appid").as_deref(), Some("m_core"));
-        assert_eq!(get("functionId").as_deref(), Some("balance_getCurrentOrder_m"));
+        assert_eq!(
+            get("functionId").as_deref(),
+            Some("balance_getCurrentOrder_m")
+        );
         assert_eq!(get("body").as_deref(), Some("{}"));
         assert_eq!(get("client").as_deref(), Some("MacIntel")); // = ORDER_CLIENT_PLATFORM = WS 签名 client
         assert_eq!(get("clientVersion").as_deref(), Some("3.0.8"));
@@ -1212,8 +1538,18 @@ mod tests {
         assert_eq!(get("h5st").as_deref(), Some("H5ST"));
         assert_eq!(p.len(), 10, "form 必须正好 10 项(对齐 h5st-probe)");
         // 确认多余字段已剔除。
-        for k in ["screen", "lang", "osVersion", "sdkVersion", "networkType",
-                  "d_brand", "d_model", "openudid", "uuid", "x-api-eid-token"] {
+        for k in [
+            "screen",
+            "lang",
+            "osVersion",
+            "sdkVersion",
+            "networkType",
+            "d_brand",
+            "d_model",
+            "openudid",
+            "uuid",
+            "x-api-eid-token",
+        ] {
             assert!(get(k).is_none(), "{k} 不应出现在 form 里");
         }
     }
@@ -1223,17 +1559,28 @@ mod tests {
     #[test]
     fn build_body_matches_success_capture() {
         let rp = RealParams {
-            device_uuid: "u".into(), address_id: String::new(),
-            location_id: String::new(), eid_token: String::new(),
+            device_uuid: "u".into(),
+            address_id: String::new(),
+            location_id: String::new(),
+            eid_token: String::new(),
         };
         let body = build_body("123375521898500", "100358632432", None, &rp);
         // resolution = 成功实测环境默认。
         assert_eq!(body["balanceDeviceInfo"]["resolution"], "390*844");
         // 对齐 h5st-probe:顶层 addressId / balanceAtmosphereRequest 都已删除。
-        assert!(body.get("addressId").is_none(), "Step1 不应有顶层 addressId");
-        assert!(body.get("balanceAtmosphereRequest").is_none(), "Step1 不应有 balanceAtmosphereRequest");
+        assert!(
+            body.get("addressId").is_none(),
+            "Step1 不应有顶层 addressId"
+        );
+        assert!(
+            body.get("balanceAtmosphereRequest").is_none(),
+            "Step1 不应有 balanceAtmosphereRequest"
+        );
         // Step1 balanceCommonOrderForm 用 inspectSkuId(成功抓包一致)。
-        assert_eq!(body["balanceCommonOrderForm"]["inspectSkuId"], "123375521898500");
+        assert_eq!(
+            body["balanceCommonOrderForm"]["inspectSkuId"],
+            "123375521898500"
+        );
         // 无 cookie 地址 → locationId 用默认。
         assert_eq!(body["locationId"], "1-72-2819-0");
     }
@@ -1251,32 +1598,70 @@ mod tests {
         };
         let body = build_body("119472350299143", "100181382451", None, &rp);
 
-        let mut top: Vec<&str> = body.as_object().unwrap().keys().map(String::as_str).collect();
+        let mut top: Vec<&str> = body
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
         top.sort_unstable();
         let mut expect_top = vec![
-            "appId", "appVersion",
-            "balanceCommonOrderForm", "balanceDeviceInfo", "bizModeClientType",
-            "bizModelCode", "cartParam", "deviceUUID", "externalLoginType", "isHK",
-            "locationId", "packageStyle", "referer", "resetGsd", "sceneval",
-            "sourceType", "tenantCode", "token", "useBestCoupon",
+            "appId",
+            "appVersion",
+            "balanceCommonOrderForm",
+            "balanceDeviceInfo",
+            "bizModeClientType",
+            "bizModelCode",
+            "cartParam",
+            "deviceUUID",
+            "externalLoginType",
+            "isHK",
+            "locationId",
+            "packageStyle",
+            "referer",
+            "resetGsd",
+            "sceneval",
+            "sourceType",
+            "tenantCode",
+            "token",
+            "useBestCoupon",
         ];
         expect_top.sort_unstable();
-        assert_eq!(top, expect_top, "Step1 body 顶层字段集必须与 h5st-probe 一致");
+        assert_eq!(
+            top, expect_top,
+            "Step1 body 顶层字段集必须与 h5st-probe 一致"
+        );
 
-        let mut form: Vec<&str> = body["balanceCommonOrderForm"].as_object().unwrap()
-            .keys().map(String::as_str).collect();
+        let mut form: Vec<&str> = body["balanceCommonOrderForm"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
         form.sort_unstable();
         let mut expect_form = vec![
-            "action", "appVersion", "inspectSkuId", "international",
-            "netBuySourceType", "overseaMerge", "supportTransport", "tradeShort",
+            "action",
+            "appVersion",
+            "inspectSkuId",
+            "international",
+            "netBuySourceType",
+            "overseaMerge",
+            "supportTransport",
+            "tradeShort",
         ];
         expect_form.sort_unstable();
-        assert_eq!(form, expect_form, "balanceCommonOrderForm 字段集必须与 h5st-probe 一致");
+        assert_eq!(
+            form, expect_form,
+            "balanceCommonOrderForm 字段集必须与 h5st-probe 一致"
+        );
 
         // 关键值精确比对。
         assert_eq!(body["locationId"], "1-72-55674-0");
         assert_eq!(body["cartParam"]["skuItem"]["skuId"], "100181382451");
-        assert_eq!(body["balanceCommonOrderForm"]["inspectSkuId"], "119472350299143");
+        assert_eq!(
+            body["balanceCommonOrderForm"]["inspectSkuId"],
+            "119472350299143"
+        );
     }
 
     /// 对齐 h5st-probe 后:Step1 body 不再含 addressId;address_id 入参被忽略;
@@ -1284,8 +1669,10 @@ mod tests {
     #[test]
     fn build_body_ignores_address_id_and_uses_location() {
         let rp = RealParams {
-            device_uuid: "u".into(), address_id: "13017040608".into(),
-            location_id: "20-1753-1754-13017040608".into(), eid_token: String::new(),
+            device_uuid: "u".into(),
+            address_id: "13017040608".into(),
+            location_id: "20-1753-1754-13017040608".into(),
+            eid_token: String::new(),
         };
         // 即使传了显式 address_id,body 里也不该出现 addressId。
         let body = build_body("i", "y", Some("999"), &rp);
@@ -1294,9 +1681,14 @@ mod tests {
         assert_eq!(body["locationId"], "20-1753-1754-13017040608");
         // location_id 为空 → 默认。
         let rp2 = RealParams {
-            device_uuid: "u".into(), address_id: String::new(),
-            location_id: String::new(), eid_token: String::new(),
+            device_uuid: "u".into(),
+            address_id: String::new(),
+            location_id: String::new(),
+            eid_token: String::new(),
         };
-        assert_eq!(build_body("i", "y", None, &rp2)["locationId"], "1-72-2819-0");
+        assert_eq!(
+            build_body("i", "y", None, &rp2)["locationId"],
+            "1-72-2819-0"
+        );
     }
 }

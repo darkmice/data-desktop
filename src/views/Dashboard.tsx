@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { Button, Card, Input, Switch, Empty, cn } from '@talon-ui/react';
+import { RefreshCw } from 'lucide-react';
 import { invoke } from '../lib/tauri';
 import { notify, useStore } from '../store/useStore';
 import { parseItemUrl } from '../lib/parseItemUrl';
@@ -53,6 +54,7 @@ export function Dashboard() {
 
   const [net, setNet] = useState<number>(-1);
   const [api, setApi] = useState<number>(-1);
+  const [preloading, setPreloading] = useState(false);
 
   // 手动下单输入值放 store(切换界面不清空,除非用户手动改/清)。
   const mUrl = useStore((s) => s.manualUrl);
@@ -118,6 +120,22 @@ export function Dashboard() {
     }
   }
 
+  async function preloadWatch() {
+    if (cats.length === 0) {
+      notify('请至少选择一个关注品类', 'err');
+      return;
+    }
+    setPreloading(true);
+    try {
+      await invoke('preload_watch', { categoryKeys: cats });
+      notify('预加载已开始', 'hit');
+    } catch (e) {
+      notify(`预加载失败: ${String(e)}`, 'err');
+    } finally {
+      setPreloading(false);
+    }
+  }
+
   async function setAuto(v: boolean) {
     if (!config) return;
     const next: AppConfig = {
@@ -175,6 +193,15 @@ export function Dashboard() {
         <div className="flex-1" />
         <Metric label="网络" ms={net} />
         <Metric label="接口" ms={api} />
+        <Button
+          variant="secondary"
+          disabled={!authed || preloading}
+          loading={preloading}
+          onClick={preloadWatch}
+        >
+          <RefreshCw size={14} className="mr-tp-1" />
+          预加载
+        </Button>
         <Button
           variant={watching ? 'danger' : 'primary'}
           disabled={!authed}

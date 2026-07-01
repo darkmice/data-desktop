@@ -240,6 +240,10 @@ impl WsClient {
         self.send(json!({"type":"stop_watch"}))
     }
 
+    pub fn preload_watch(&self) -> Result<(), String> {
+        self.send(json!({"type":"preload_watch"}))
+    }
+
     /// Push this client's system/environment info to the server (sent once right
     /// after auth). Telemetry — best-effort, callers ignore the result.
     pub fn send_client_info(&self, info: &Value) -> Result<(), String> {

@@ -1124,6 +1124,28 @@ pub async fn start_watch(
 }
 
 #[tauri::command]
+pub async fn preload_watch(
+    state: State<'_, Arc<AppState>>,
+    category_keys: Vec<String>,
+) -> Result<(), String> {
+    let ws = state
+        .ws
+        .lock()
+        .await
+        .as_ref()
+        .cloned()
+        .ok_or("研究功能尚未就绪")?;
+
+    if category_keys.is_empty() {
+        return Err("请至少选择一个关注品类".into());
+    }
+
+    ws.watch_config(&json!({ "category_keys": category_keys }))?;
+    ws.preload_watch()?;
+    Ok(())
+}
+
+#[tauri::command]
 pub async fn stop_watch(state: State<'_, Arc<AppState>>) -> Result<(), String> {
     if let Some(ws) = state.ws.lock().await.as_ref() {
         ws.stop_watch()?;
@@ -1308,6 +1330,7 @@ pub fn run() {
             reenable_rule,
             connect,
             start_watch,
+            preload_watch,
             stop_watch,
             manual_submit,
             get_orders,

@@ -1,3 +1,5 @@
 {
-  "server_url": "ws://127.0.0.1:8443/ws"
+  "server_url": "ws://127.0.0.1:8443/ws",
+  "auto_submit": false,
+  "auto_submit_delay_secs": 1
 }

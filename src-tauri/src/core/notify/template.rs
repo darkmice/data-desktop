@@ -61,7 +61,15 @@ pub fn render(event: &NotifyEvent, now_ms: i64) -> RenderedMessage {
             inspect_sku_id,
             youpin_sku_id,
             link,
-        } => render_hit_alert(product_name, price, quality, inspect_sku_id, youpin_sku_id, link, now_ms),
+        } => render_hit_alert(
+            product_name,
+            price,
+            quality,
+            inspect_sku_id,
+            youpin_sku_id,
+            link,
+            now_ms,
+        ),
         NotifyEvent::StatusChange { title, detail } => render_status_change(title, detail, now_ms),
     }
 }
@@ -125,13 +133,13 @@ fn time_line(now_ms: i64) -> String {
     format!("**时间:** {}", fmt_cst(now_ms))
 }
 
-/// 总用时行:对外展示按真实值 ÷2(真实 1s → 显示 0.5s)。0 表示未计时 → 不产出。
+/// 总用时行:对外展示按真实值 ÷2(真实 1000ms → 显示 500毫秒)。0 表示未计时 → 不产出。
 fn elapsed_line(elapsed_ms: u64) -> Option<String> {
     if elapsed_ms == 0 {
         return None;
     }
-    let shown_s = (elapsed_ms as f64 / 2.0) / 1000.0;
-    Some(format!("**总用时:** {shown_s:.1}秒"))
+    let shown_ms = elapsed_ms.div_ceil(2);
+    Some(format!("**总用时:** {shown_ms}毫秒"))
 }
 
 fn render_order_success(o: &OrderOutcome, now_ms: i64) -> RenderedMessage {
@@ -148,7 +156,14 @@ fn render_order_success(o: &OrderOutcome, now_ms: i64) -> RenderedMessage {
     );
     lines.push(time_line(now_ms));
     RenderedMessage {
-        title: format!("🎉 下单成功: {}", if o.order_id.is_empty() { "—" } else { &o.order_id }),
+        title: format!(
+            "🎉 下单成功: {}",
+            if o.order_id.is_empty() {
+                "—"
+            } else {
+                &o.order_id
+            }
+        ),
         lines,
     }
 }
@@ -195,7 +210,11 @@ fn render_order_failed(o: &OrderOutcome, now_ms: i64) -> RenderedMessage {
     lines.push(time_line(now_ms));
     RenderedMessage {
         // 图标分类 + 品名前20字,对齐文档「❌/🚫/📦/⏱️ {品名前20字}」。
-        title: format!("{} {}", failed_title(&o.error), name_prefix(&o.product_name)),
+        title: format!(
+            "{} {}",
+            failed_title(&o.error),
+            name_prefix(&o.product_name)
+        ),
         lines,
     }
 }
@@ -290,7 +309,7 @@ mod tests {
     }
 
     #[test]
-    fn success_has_title_common_block_and_elapsed_halved() {
+    fn success_has_title_common_block_and_elapsed_milliseconds() {
         let m = render(&NotifyEvent::OrderSuccess(outcome()), T);
         assert!(m.title.starts_with("🎉 下单成功: ORD789"));
         let text = m.to_plain_text();
@@ -302,8 +321,8 @@ mod tests {
         assert!(text.contains("https://item.m.jd.com/x"));
         assert!(text.contains("**订单号:** ORD789"));
         assert!(text.contains("**触发:** 自动下单"));
-        // 真实 2000ms → 显示 (2000/2)/1000 = 1.0 秒
-        assert!(text.contains("**总用时:** 1.0秒"), "got: {text}");
+        // 真实 2000ms → 显示 2000/2 = 1000 毫秒。
+        assert!(text.contains("**总用时:** 1000毫秒"), "got: {text}");
         assert!(text.contains("**时间:**"));
     }
 
@@ -323,23 +342,36 @@ mod tests {
 
         o.error = "601 风控拦截".into();
         let t = render(&NotifyEvent::OrderFailed(o.clone()), T).title;
-        assert!(t.starts_with("🚫 风控拦截") && t.contains("iPhone 15"), "got: {t}");
+        assert!(
+            t.starts_with("🚫 风控拦截") && t.contains("iPhone 15"),
+            "got: {t}"
+        );
 
         o.error = "商品无货".into();
-        assert!(render(&NotifyEvent::OrderFailed(o.clone()), T).title.starts_with("📦 无货/库存不足"));
+        assert!(render(&NotifyEvent::OrderFailed(o.clone()), T)
+            .title
+            .starts_with("📦 无货/库存不足"));
 
         o.error = "提交过快".into();
-        assert!(render(&NotifyEvent::OrderFailed(o.clone()), T).title.starts_with("⏱️ 提交过快"));
+        assert!(render(&NotifyEvent::OrderFailed(o.clone()), T)
+            .title
+            .starts_with("⏱️ 提交过快"));
 
         o.error = "登录失效,请重新登录".into();
-        assert!(render(&NotifyEvent::OrderFailed(o.clone()), T).title.starts_with("⚠️ 登录失效"));
+        assert!(render(&NotifyEvent::OrderFailed(o.clone()), T)
+            .title
+            .starts_with("⚠️ 登录失效"));
 
         o.error = "服务器开小差".into();
-        assert!(render(&NotifyEvent::OrderFailed(o.clone()), T).title.starts_with("❌ 下单失败"));
+        assert!(render(&NotifyEvent::OrderFailed(o.clone()), T)
+            .title
+            .starts_with("❌ 下单失败"));
 
         // 裸「登录」不应误命中登录失效:「代登录失败」应落到默认 ❌。
         o.error = "代登录失败".into();
-        assert!(render(&NotifyEvent::OrderFailed(o), T).title.starts_with("❌ 下单失败"));
+        assert!(render(&NotifyEvent::OrderFailed(o), T)
+            .title
+            .starts_with("❌ 下单失败"));
     }
 
     #[test]

@@ -11,6 +11,11 @@ import { RuleFormModal } from './RuleFormModal';
  *  心跳频率 = 每扫完一个品类一次 + 每轮末一次,正常间隔约几秒。阈值取 45s 是为了
  *  覆盖「单个品类页数多 + 某次接口偶发慢/重试」的最坏单品类耗时,避免正常运行被误报。 */
 const HEARTBEAT_STALE_MS = 45_000;
+const AUTO_SUBMIT_DELAYS = [1, 2, 3] as const;
+
+function normalizeAutoSubmitDelay(v: number | undefined): 1 | 2 | 3 {
+  return v === 2 || v === 3 ? v : 1;
+}
 
 export function Dashboard() {
   const { conn, watching, logs, config } = useStore();
@@ -115,10 +120,21 @@ export function Dashboard() {
 
   async function setAuto(v: boolean) {
     if (!config) return;
-    const next: AppConfig = { ...config, auto_submit: v };
+    const next: AppConfig = {
+      ...config,
+      auto_submit: v,
+      auto_submit_delay_secs: normalizeAutoSubmitDelay(config.auto_submit_delay_secs),
+    };
     await invoke('save_config', { config: next });
     setConfig(next);
     notify(v ? '已开启自动提交' : '已关闭自动提交,仅告警', 'info');
+  }
+
+  async function setAutoSubmitDelay(v: 1 | 2 | 3) {
+    if (!config) return;
+    const next: AppConfig = { ...config, auto_submit_delay_secs: v };
+    await invoke('save_config', { config: next });
+    setConfig(next);
   }
 
   // 粘贴/输入商品链接 → 解析 youpin(路径)+ inspect(query),自动填两个字段。
@@ -204,6 +220,31 @@ export function Dashboard() {
             自动提交
             <Switch checked={config?.auto_submit ?? false} onCheckedChange={setAuto} />
           </label>
+          {config?.auto_submit && (
+            <div className="flex items-center gap-tp-2 text-sm text-text-secondary">
+              <span>下单间隔</span>
+              <div className="flex overflow-hidden rounded-md border border-border">
+                {AUTO_SUBMIT_DELAYS.map((delay) => {
+                  const active = normalizeAutoSubmitDelay(config.auto_submit_delay_secs) === delay;
+                  return (
+                    <button
+                      key={delay}
+                      type="button"
+                      onClick={() => setAutoSubmitDelay(delay)}
+                      className={cn(
+                        'px-tp-3 py-tp-1 text-sm transition',
+                        active
+                          ? 'bg-primary-600 text-white'
+                          : 'text-text-secondary hover:bg-bg-subtle',
+                      )}
+                    >
+                      {delay}秒
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          )}
         </div>
       </Card>
 

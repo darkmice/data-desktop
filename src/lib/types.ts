@@ -24,6 +24,7 @@ export interface AppConfig {
   token: string;
   insecure_tls: boolean;
   auto_submit: boolean;
+  auto_submit_delay_secs: number;
   /** 旧版单钉钉配置,仅向后兼容(新 UI 写 notify_channels)。 */
   dingtalk_webhook: string;
   dingtalk_secret: string;

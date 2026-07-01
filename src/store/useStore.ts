@@ -130,12 +130,39 @@ interface ToastItem {
   duration?: number;
 }
 interface ToastApi {
-  toast: (item: ToastItem) => void;
+  toast: (item: ToastItem) => string;
   dismiss: (id?: string) => void;
 }
 
 let toastApi: ToastApi | null = null;
+const toastTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+function clearToastTimer(id: string): void {
+  const timer = toastTimers.get(id);
+  if (timer) {
+    clearTimeout(timer);
+    toastTimers.delete(id);
+  }
+}
+
+function clearAllToastTimers(): void {
+  for (const timer of toastTimers.values()) clearTimeout(timer);
+  toastTimers.clear();
+}
+
+function scheduleToastDismiss(id: string, duration: number): void {
+  clearToastTimer(id);
+  toastTimers.set(
+    id,
+    setTimeout(() => {
+      toastTimers.delete(id);
+      toastApi?.dismiss(id);
+    }, duration),
+  );
+}
+
 export function registerToast(api: ToastApi | null): void {
+  if (!api) clearAllToastTimers();
   toastApi = api;
 }
 
@@ -151,6 +178,12 @@ export const TX = {
   CONN: 'tx-conn',
 } as const;
 
+const TOAST_DURATION_MS: Record<LogLine['kind'], number> = {
+  info: 3500,
+  hit: 3500,
+  err: 6000,
+};
+
 /**
  * 重要提示统一入口:**同时**弹吐司 + 写运行日志。
  * 传 `txId` 时,同一事务的吐司会覆盖显示(先 dismiss 旧的再弹新的),
@@ -160,13 +193,18 @@ export function notify(msg: string, kind: LogLine['kind'] = 'info', txId?: strin
   useStore.getState().pushLog(msg, kind);
   if (!toastApi) return;
   // 同事务:先移除上一条同 id 吐司,再以同 id 弹新的 → 视觉上是"覆盖"。
-  if (txId) toastApi.dismiss(txId);
-  toastApi.toast({
+  if (txId) {
+    clearToastTimer(txId);
+    toastApi.dismiss(txId);
+  }
+  const duration = TOAST_DURATION_MS[kind];
+  const toastId = toastApi.toast({
     id: txId,
     description: msg,
     tone: KIND_TONE[kind],
-    duration: kind === 'err' ? 6000 : 3500,
+    duration,
   });
+  scheduleToastDismiss(toastId, duration);
 }
 
 /** 从日志文本推断级别(沿用旧前端的中文关键词规则)。 */

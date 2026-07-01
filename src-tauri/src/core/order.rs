@@ -617,7 +617,7 @@ async fn order_once_inner<S: Signer, H: OrderHttp>(
             return OrderResult {
                 credential: cred.name.clone(),
                 ..OrderResult::fail(e)
-            }
+            };
         }
     };
     let b1 = &r1["body"];
@@ -822,7 +822,8 @@ pub async fn order_with_rotation_probe<S: Signer>(
             tried += 1;
             continue;
         }
-        let res = order_once_probe(signer, &creds[idx], inspect_id, youpin_id).await;
+        logs.push(format!("使用凭证: {}", creds[idx].name));
+        let res = order_once_probe(signer, &creds[idx], inspect_id, youpin_id, logs).await;
 
         if res.success {
             creds[idx].status = ck::CredStatus::Active;
@@ -855,6 +856,43 @@ pub async fn order_with_rotation_probe<S: Signer>(
     (result, creds, idx)
 }
 
+/// 下单(probe 库版):只使用调用方已经分配好的单把 CK,不在这里做多 CK 轮换。
+/// 自动下单并发时由 app 层先抢占 CK 槽位,再调用这个函数,避免多个 SKU 同时命中
+/// 时都从同一个 `active_idx` 开始轮换。
+pub async fn order_with_assigned_credential_probe<S: Signer>(
+    signer: &S,
+    mut cred: Credential,
+    inspect_id: &str,
+    youpin_id: &str,
+    logs: &mut Vec<String>,
+) -> (OrderResult, Credential) {
+    if cred.status == ck::CredStatus::Expired {
+        return (OrderResult::fail("凭证已过期,请更新凭证"), cred);
+    }
+
+    logs.push(format!("使用凭证: {}", cred.name));
+    let res = order_once_probe(signer, &cred, inspect_id, youpin_id, logs).await;
+
+    if res.success {
+        cred.status = ck::CredStatus::Active;
+        cred.valid = true;
+        return (res, cred);
+    }
+
+    logs.push(format!("提交失败 ({}): {}", cred.name, res.error));
+    if needs_rotation(&res.error) {
+        cred.status = ck::CredStatus::Expired;
+        cred.valid = false;
+        logs.push(format!("凭证 {} 已失效", cred.name));
+    } else if res.error.contains("601") || res.error.contains("过快") || res.error.contains("频")
+    {
+        cred.status = ck::CredStatus::RiskControlled;
+        cred.valid = true;
+    }
+
+    (res, cred)
+}
+
 /// 单把 CK 的完整下单:probe body + WS 签名 + probe send。Step1→构造→Step2,
 /// 命中"提交过快"等 1s 重试一次(对齐 probe order::place_order 的编排)。
 async fn order_once_probe<S: Signer>(
@@ -862,48 +900,77 @@ async fn order_once_probe<S: Signer>(
     cred: &Credential,
     inspect_id: &str,
     youpin_id: &str,
+    logs: &mut Vec<String>,
 ) -> OrderResult {
     use h5st_probe::{body as pbody, send as psend};
+    let attempt_start = std::time::Instant::now();
 
+    let stage = std::time::Instant::now();
     let cookies = ck::parse_cookies(&cred.cookie_str);
     let rp = ck::extract_real_params(&cookies);
+    push_order_timing(logs, &attempt_start, "解析 CK", stage);
+
+    let stage = std::time::Instant::now();
     let device = match resolve_probe_device_uuid(signer, &rp).await {
-        Ok(device) => device,
+        Ok(device) => {
+            push_order_timing(logs, &attempt_start, "获取 deviceUUID", stage);
+            device
+        }
         Err(e) => {
+            push_order_timing(logs, &attempt_start, "获取 deviceUUID 失败", stage);
+            push_order_total(logs, &attempt_start, "失败");
             return OrderResult {
                 credential: cred.name.clone(),
                 ..OrderResult::fail(e)
-            }
+            };
         }
     };
     let ck_str = cred.cookie_str.as_str();
 
     // ===== Step1: getCurrentOrder(probe body + WS 签名 + probe send)=====
+    let stage = std::time::Instant::now();
     let body1 = pbody::build_get_current_order_body(&device, youpin_id, inspect_id);
+    push_order_timing(logs, &attempt_start, "Step1 构造 body", stage);
+
+    let stage = std::time::Instant::now();
     let signed1 = match sign_via_ws(signer, "balance_getCurrentOrder_m", &body1).await {
-        Ok(s) => s,
+        Ok(s) => {
+            push_order_timing(logs, &attempt_start, "Step1 签名", stage);
+            s
+        }
         Err(e) => {
+            push_order_timing(logs, &attempt_start, "Step1 签名失败", stage);
+            push_order_total(logs, &attempt_start, "失败");
             return OrderResult {
                 credential: cred.name.clone(),
                 ..OrderResult::fail(e)
-            }
+            };
         }
     };
+    let stage = std::time::Instant::now();
     let r1 = match psend::call(&signed1, ck_str, youpin_id).await {
-        Ok(r) => r,
+        Ok(r) => {
+            push_order_timing(logs, &attempt_start, "Step1 请求", stage);
+            r
+        }
         Err(e) => {
+            push_order_timing(logs, &attempt_start, "Step1 请求失败", stage);
+            push_order_total(logs, &attempt_start, "失败");
             return OrderResult {
                 credential: cred.name.clone(),
                 ..OrderResult::fail(format!("Step1 发请求失败: {e}"))
-            }
+            };
         }
     };
+    let stage = std::time::Instant::now();
     if !r1.is_ok() {
         let msg = if r1.error_reason.is_empty() {
             format!("Step1 未成功: code={} {}", r1.code, r1.raw_snippet)
         } else {
             r1.error_reason.clone()
         };
+        push_order_timing(logs, &attempt_start, "Step1 校验响应", stage);
+        push_order_total(logs, &attempt_start, "失败");
         return OrderResult {
             credential: cred.name.clone(),
             ..OrderResult::fail(msg)
@@ -911,34 +978,87 @@ async fn order_once_probe<S: Signer>(
     }
     let b1 = r1.body().clone();
     let price = b1["balanceTotal"]["factPrice"].to_string();
+    push_order_timing(logs, &attempt_start, "Step1 解析响应", stage);
 
     // ===== 本地构造 Step2 body(probe)=====
+    let stage = std::time::Instant::now();
     let now2 = now_unix_ms();
     let body2 = pbody::build_submit_order_body(&b1, &device, youpin_id, inspect_id, now2);
+    push_order_timing(logs, &attempt_start, "Step2 构造 body", stage);
 
     // ===== Step2: submitOrder(probe body + WS 签名 + probe send)+ 过快重试一次 =====
-    let mut r2 = match submit_once_probe(signer, &body2, ck_str, youpin_id).await {
-        Ok(r) => r,
+    let stage = std::time::Instant::now();
+    let signed2 = match sign_via_ws(signer, "balance_submitOrder_m", &body2).await {
+        Ok(s) => {
+            push_order_timing(logs, &attempt_start, "Step2 签名", stage);
+            s
+        }
         Err(e) => {
+            push_order_timing(logs, &attempt_start, "Step2 签名失败", stage);
+            push_order_total(logs, &attempt_start, "失败");
             return OrderResult {
                 credential: cred.name.clone(),
                 price,
                 ..OrderResult::fail(e)
-            }
+            };
+        }
+    };
+    let stage = std::time::Instant::now();
+    let mut r2 = match psend::call(&signed2, ck_str, youpin_id).await {
+        Ok(r) => {
+            push_order_timing(logs, &attempt_start, "Step2 请求", stage);
+            r
+        }
+        Err(e) => {
+            push_order_timing(logs, &attempt_start, "Step2 请求失败", stage);
+            push_order_total(logs, &attempt_start, "失败");
+            return OrderResult {
+                credential: cred.name.clone(),
+                price,
+                ..OrderResult::fail(format!("Step2 发请求失败: {e}"))
+            };
         }
     };
     if order_too_fast(&r2) {
+        logs.push("[下单耗时] Step2 触发过快重试".to_string());
+        let stage = std::time::Instant::now();
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        push_order_timing(logs, &attempt_start, "Step2 重试等待", stage);
+
+        let stage = std::time::Instant::now();
         let body2_retry =
             pbody::build_submit_order_body(&b1, &device, youpin_id, inspect_id, now_unix_ms());
-        if let Ok(r) = submit_once_probe(signer, &body2_retry, ck_str, youpin_id).await {
-            r2 = r;
+        push_order_timing(logs, &attempt_start, "Step2 重试构造 body", stage);
+
+        let stage = std::time::Instant::now();
+        match sign_via_ws(signer, "balance_submitOrder_m", &body2_retry).await {
+            Ok(signed_retry) => {
+                push_order_timing(logs, &attempt_start, "Step2 重试签名", stage);
+                let stage = std::time::Instant::now();
+                match psend::call(&signed_retry, ck_str, youpin_id).await {
+                    Ok(r) => {
+                        push_order_timing(logs, &attempt_start, "Step2 重试请求", stage);
+                        r2 = r;
+                    }
+                    Err(e) => {
+                        push_order_timing(logs, &attempt_start, "Step2 重试请求失败", stage);
+                        logs.push(format!("Step2 重试发请求失败: {e}"));
+                    }
+                }
+            }
+            Err(e) => {
+                push_order_timing(logs, &attempt_start, "Step2 重试签名失败", stage);
+                logs.push(format!("Step2 重试签名失败: {e}"));
+            }
         }
     }
 
+    let stage = std::time::Instant::now();
     let order_id = order_id_of_probe(&r2);
+    push_order_timing(logs, &attempt_start, "Step2 解析结果", stage);
     if r2.code == "0" && !order_id.is_empty() && order_id != "null" {
         let op = r2.body()["order"]["orderPrice"].to_string();
+        push_order_total(logs, &attempt_start, "成功");
         OrderResult {
             success: true,
             order_id,
@@ -956,12 +1076,38 @@ async fn order_once_probe<S: Signer>(
         } else {
             format!("未拿到 orderId: {}", r2.raw_snippet)
         };
+        push_order_total(logs, &attempt_start, "失败");
         OrderResult {
             credential: cred.name.clone(),
             price,
             ..OrderResult::fail(err)
         }
     }
+}
+
+fn push_order_timing(
+    logs: &mut Vec<String>,
+    attempt_start: &std::time::Instant,
+    stage: &str,
+    stage_start: std::time::Instant,
+) {
+    logs.push(format_order_timing(
+        stage,
+        stage_start.elapsed().as_millis(),
+        attempt_start.elapsed().as_millis(),
+    ));
+}
+
+fn push_order_total(logs: &mut Vec<String>, attempt_start: &std::time::Instant, status: &str) {
+    logs.push(format_order_total(status, attempt_start.elapsed().as_millis()));
+}
+
+fn format_order_timing(stage: &str, stage_ms: u128, cumulative_ms: u128) -> String {
+    format!("[下单耗时] {stage}: {stage_ms}毫秒 | 累计 {cumulative_ms}毫秒")
+}
+
+fn format_order_total(status: &str, elapsed_ms: u128) -> String {
+    format!("[下单耗时] 单凭证{status}: {elapsed_ms}毫秒")
 }
 
 fn usable_device_uuid(s: &str) -> bool {
@@ -1029,18 +1175,6 @@ async fn sign_via_ws<S: Signer>(
         seg3,
         seg7_len: 0,
     })
-}
-
-async fn submit_once_probe<S: Signer>(
-    signer: &S,
-    body2: &serde_json::Value,
-    ck: &str,
-    youpin: &str,
-) -> Result<h5st_probe::send::CallResult, String> {
-    let signed = sign_via_ws(signer, "balance_submitOrder_m", body2).await?;
-    h5st_probe::send::call(&signed, ck, youpin)
-        .await
-        .map_err(|e| format!("Step2 发请求失败: {e}"))
 }
 
 fn order_id_of_probe(r: &h5st_probe::send::CallResult) -> String {
@@ -1421,6 +1555,42 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(device, "ck-dev-789");
+    }
+
+    #[test]
+    fn timing_logs_use_milliseconds() {
+        let mut logs = Vec::new();
+        let start = std::time::Instant::now();
+        push_order_timing(&mut logs, &start, "测试阶段", start);
+        push_order_total(&mut logs, &start, "成功");
+        assert!(logs[0].contains("[下单耗时] 测试阶段:"));
+        assert!(logs[0].contains("毫秒 | 累计"));
+        assert!(logs[1].contains("[下单耗时] 单凭证成功:"));
+        assert!(logs[1].contains("毫秒"));
+    }
+
+    #[test]
+    fn timing_log_format_keeps_raw_milliseconds_for_server() {
+        assert_eq!(
+            format_order_timing("测试阶段", 120, 240),
+            "[下单耗时] 测试阶段: 120毫秒 | 累计 240毫秒"
+        );
+        assert_eq!(
+            format_order_total("成功", 333),
+            "[下单耗时] 单凭证成功: 333毫秒"
+        );
+    }
+
+    #[tokio::test]
+    async fn assigned_probe_does_not_rotate_expired_credential() {
+        let mut logs = Vec::new();
+        let mut one = creds(&["a"]).remove(0);
+        one.status = ck::CredStatus::Expired;
+        let (r, updated) =
+            order_with_assigned_credential_probe(&FakeSigner, one, "i1", "y1", &mut logs).await;
+        assert!(!r.success);
+        assert_eq!(updated.status, ck::CredStatus::Expired);
+        assert!(logs.is_empty());
     }
 
     /// 601 = 风控(间歇性),不是凭证失效:必须【不轮换、不禁用凭证】,失败返回但

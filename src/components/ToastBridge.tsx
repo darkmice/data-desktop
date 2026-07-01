@@ -7,7 +7,7 @@ import { registerToast } from '../store/useStore';
 export function ToastBridge() {
   const { toast, dismiss } = useToast();
   useEffect(() => {
-    registerToast({ toast: (item) => void toast(item), dismiss });
+    registerToast({ toast, dismiss });
     return () => registerToast(null);
   }, [toast, dismiss]);
   return null;

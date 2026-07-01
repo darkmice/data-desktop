@@ -2,7 +2,11 @@
 //! reaction to `sku_hit`. Service address + token come from a config file /
 //! settings; the UI shows only a connection light.
 
-use std::sync::{Arc, OnceLock};
+use std::{
+    collections::HashSet,
+    sync::{Arc, OnceLock},
+    time::{Duration, Instant},
+};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -11,11 +15,11 @@ use tokio::sync::{mpsc, Mutex};
 
 use crate::core::ck::{self, Credential};
 use crate::core::history::{Filter, HistoryStore, OrderRecord};
-use crate::core::notify::{
-    Channel, DingTalkChannel, FeishuChannel, NotifyEvent, Notifier, OrderOutcome,
-};
 use crate::core::notify::channel::Subscriptions;
 use crate::core::notify::event::EventKind;
+use crate::core::notify::{
+    Channel, DingTalkChannel, FeishuChannel, Notifier, NotifyEvent, OrderOutcome,
+};
 use crate::core::order::{self, OrderResult, WreqHttp};
 use crate::core::rules::{self, Rule};
 use crate::ws_client::{WsClient, WsEvent};
@@ -31,6 +35,10 @@ pub struct AppConfig {
     pub insecure_tls: bool,
     #[serde(default)]
     pub auto_submit: bool,
+    /// Delay between automatic order starts in single-CK mode. Clamped to 1-3
+    /// seconds before use.
+    #[serde(default = "default_auto_submit_delay_secs")]
+    pub auto_submit_delay_secs: u64,
     /// 旧版单一钉钉配置。**保留仅为向后兼容**:旧 config 升级后,若 `notify_channels`
     /// 为空而这两个字段非空,启动时会自动迁移成一个钉钉渠道(见 `build_notifier`)。
     /// 新 UI 写入 `notify_channels`,不再写这里。
@@ -65,6 +73,19 @@ fn default_theme() -> String {
     "dark".into()
 }
 
+fn default_auto_submit_delay_secs() -> u64 {
+    1
+}
+
+fn sanitize_auto_submit_delay_secs(v: u64) -> u64 {
+    v.clamp(1, 3)
+}
+
+fn sanitize_config(mut cfg: AppConfig) -> AppConfig {
+    cfg.auto_submit_delay_secs = sanitize_auto_submit_delay_secs(cfg.auto_submit_delay_secs);
+    cfg
+}
+
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
@@ -77,6 +98,7 @@ impl Default for AppConfig {
             token: option_env!("PAIPAI_DEV_TOKEN").unwrap_or("").into(),
             insecure_tls: true,
             auto_submit: false,
+            auto_submit_delay_secs: default_auto_submit_delay_secs(),
             dingtalk_webhook: String::new(),
             dingtalk_secret: String::new(),
             notify_channels: Vec::new(),
@@ -182,14 +204,52 @@ pub struct AppState {
     /// 通知渠道(钉钉/飞书)用的普通 HTTP 客户端。与下单的 wreq 分开:通知不需要
     /// impersonate 浏览器,用 reqwest 即可。
     pub notify_http: reqwest::Client,
-    /// Serializes order attempts so concurrent submits (two sku_hit events, or a
-    /// hit racing a manual submit) cannot interleave their read-modify-write of
-    /// creds/active_idx. Held for the whole attempt.
+    /// Serializes manual multi-credential rotation so its read-modify-write of
+    /// creds/active_idx stays coherent. Automatic submit uses `auto_submit`.
     pub order_lock: Mutex<()>,
+    /// Automatic submit scheduler: dedupes SKU hits and assigns CK slots without
+    /// serializing the whole order attempt.
+    pub auto_submit: Mutex<AutoSubmitState>,
     /// Local order-history store (SQLite). Initialized in `setup` once the app
     /// data dir is known; `None` until then (and if opening failed → history
     /// degrades gracefully, the rest of the app keeps working).
     pub history: OnceLock<HistoryStore>,
+}
+
+#[derive(Debug, Default)]
+pub struct AutoSubmitState {
+    submitted_skus: HashSet<String>,
+    exclusive_ck_in_flight: HashSet<usize>,
+    single_ck_reserved: usize,
+    last_single_ck_start: Option<Instant>,
+}
+
+impl AutoSubmitState {
+    fn clear_submitted_skus(&mut self) {
+        self.submitted_skus.clear();
+        if self.single_ck_reserved == 0 {
+            self.last_single_ck_start = None;
+        }
+    }
+}
+
+#[derive(Clone)]
+struct AutoSubmitLease {
+    ck_index: usize,
+    credential: Credential,
+    start_delay: Duration,
+    mode: AutoSubmitLeaseMode,
+}
+
+#[derive(Clone, Copy)]
+enum AutoSubmitLeaseMode {
+    Exclusive,
+    SharedSingle,
+}
+
+enum AutoSubmitReserve {
+    Run(AutoSubmitLease),
+    Drop(&'static str),
 }
 
 impl AppState {
@@ -206,6 +266,7 @@ impl AppState {
                 .build()
                 .expect("reqwest"),
             order_lock: Mutex::new(()),
+            auto_submit: Mutex::new(AutoSubmitState::default()),
             history: OnceLock::new(),
         }
     }
@@ -276,6 +337,7 @@ fn load_persisted(state: &AppState) {
             if cfg.server_url.trim().is_empty() {
                 cfg.server_url = AppConfig::default().server_url;
             }
+            cfg = sanitize_config(cfg);
             *state.config.blocking_lock() = cfg;
         }
     }
@@ -314,7 +376,10 @@ struct RuntimeConfigFile {
 ///   - 部署方改运行目录 config.json → 新装/未配置的客户端默认连该地址;
 ///   - 用户在界面改过地址(已落库非默认)→ 尊重用户,文件不覆盖。
 fn apply_runtime_config_file(state: &AppState) {
-    let exe_dir = match std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf())) {
+    let exe_dir = match std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+    {
         Some(d) => d,
         None => return,
     };
@@ -349,6 +414,7 @@ pub async fn get_config(state: State<'_, Arc<AppState>>) -> Result<AppConfig, St
 pub async fn save_config(state: State<'_, Arc<AppState>>, config: AppConfig) -> Result<(), String> {
     // 签名只有一套(= h5st-probe codex 模式),不再有 recipe 切换。sign_recipe 字段
     // 保留仅为兼容旧持久化/前端类型,不再影响签名行为。
+    let config = sanitize_config(config);
     *state.config.lock().await = config.clone();
     persist(&state, KV_CONFIG, &config);
     Ok(())
@@ -377,7 +443,11 @@ pub async fn import_credential(
     {
         let mut creds = state.creds.lock().await;
         creds.push(Credential {
-            name: if name.is_empty() { "未命名".into() } else { name },
+            name: if name.is_empty() {
+                "未命名".into()
+            } else {
+                name
+            },
             cookie_str,
             status: ck::CredStatus::Active,
             valid: true,
@@ -388,7 +458,10 @@ pub async fn import_credential(
 }
 
 #[tauri::command]
-pub async fn delete_credential(state: State<'_, Arc<AppState>>, index: usize) -> Result<(), String> {
+pub async fn delete_credential(
+    state: State<'_, Arc<AppState>>,
+    index: usize,
+) -> Result<(), String> {
     {
         let mut creds = state.creds.lock().await;
         if index < creds.len() {
@@ -505,7 +578,8 @@ pub async fn connect(app: AppHandle, state: State<'_, Arc<AppState>>) -> Result<
     let (ev_tx, mut ev_rx) = mpsc::unbounded_channel::<WsEvent>();
     // wss + 后端 https 无证书:insecure 恒 true(复用 ws_client 的 NoVerify 验证器)。
     // url 连不通 → 提示联系管理员更新 Token(而非暴露底层网络错误)。
-    let ws = match WsClient::connect(&resolved_url, &resolved_tok, true, master_key(), ev_tx).await {
+    let ws = match WsClient::connect(&resolved_url, &resolved_tok, true, master_key(), ev_tx).await
+    {
         Ok(ws) => ws,
         Err(e) => {
             tracing::warn!(error = %e, "WS 连接失败");
@@ -568,7 +642,11 @@ pub async fn connect(app: AppHandle, state: State<'_, Arc<AppState>>) -> Result<
                         "token revoked" => "研究测试 Token 已停用,请在设置中更换后重试",
                         _ => "研究测试 Token 校验未通过,请在设置中检查后重试",
                     };
-                    emit(&app2, "conn", json!({"status":"disconnected","reason": reason}));
+                    emit(
+                        &app2,
+                        "conn",
+                        json!({"status":"disconnected","reason": reason}),
+                    );
                     emit(&app2, "log", json!({"msg": reason}));
                 }
                 WsEvent::Kicked { code, message: _ } => {
@@ -585,14 +663,18 @@ pub async fn connect(app: AppHandle, state: State<'_, Arc<AppState>>) -> Result<
                         // kicked / 其它:统一为"研究功能暂不可用"。
                         _ => "研究功能暂时不可用,请稍后重试",
                     };
-                    emit(&app2, "conn", json!({"status":"disconnected","reason": reason}));
+                    emit(
+                        &app2,
+                        "conn",
+                        json!({"status":"disconnected","reason": reason}),
+                    );
                     emit(&app2, "log", json!({"msg": reason}));
                 }
                 WsEvent::SkuHit(sku) => {
                     emit(&app2, "sku_hit", sku.clone());
                     // Run the order flow in its own task so a slow submit does
                     // not block the event pump (signed/log/status events keep
-                    // flowing). Concurrency is bounded by `order_lock`.
+                    // flowing). Auto-submit scheduling assigns CK slots.
                     let app3 = app2.clone();
                     let state3 = state2.clone();
                     tokio::spawn(async move {
@@ -616,8 +698,130 @@ fn emit(app: &AppHandle, event: &str, payload: Value) {
 /// flow); server-originated logs already live on the server and aren't echoed back.
 async fn relay_log(app: &AppHandle, state: &AppState, level: &str, msg: &str) {
     emit(app, "log", json!({ "msg": msg }));
+    mirror_log_to_server(state, level, msg).await;
+}
+
+async fn mirror_log_to_server(state: &AppState, level: &str, msg: &str) {
     if let Some(ws) = state.ws.lock().await.as_ref() {
         let _ = ws.send_op_log(now_ms(), level, msg);
+    }
+}
+
+fn is_order_timing_log(msg: &str) -> bool {
+    msg.starts_with("[下单耗时]")
+}
+
+async fn publish_order_log(app: &AppHandle, state: &AppState, msg: &str) {
+    if is_order_timing_log(msg) {
+        mirror_log_to_server(state, "info", msg).await;
+    } else {
+        relay_log(app, state, "info", msg).await;
+    }
+}
+
+fn auto_submit_key(inspect_id: &str, youpin_id: &str) -> String {
+    format!("{inspect_id}|{youpin_id}")
+}
+
+fn usable_credential_indices(creds: &[Credential], active_idx: usize) -> Vec<usize> {
+    if creds.is_empty() {
+        return Vec::new();
+    }
+    let start = active_idx.min(creds.len() - 1);
+    (0..creds.len())
+        .map(|offset| (start + offset) % creds.len())
+        .filter(|&idx| creds[idx].status != ck::CredStatus::Expired)
+        .collect()
+}
+
+fn reserve_single_ck_start(slots: &mut AutoSubmitState, delay: Duration) -> Duration {
+    let now = Instant::now();
+    let start_at = slots
+        .last_single_ck_start
+        .map(|last| last + delay)
+        .filter(|next| *next > now)
+        .unwrap_or(now);
+    slots.last_single_ck_start = Some(start_at);
+    start_at.saturating_duration_since(now)
+}
+
+async fn reserve_auto_submit(
+    state: &AppState,
+    sku_key: String,
+    delay_secs: u64,
+) -> AutoSubmitReserve {
+    let creds = state.creds.lock().await.clone();
+    let active_idx = *state.active_idx.lock().await;
+    let usable = usable_credential_indices(&creds, active_idx);
+
+    let mut slots = state.auto_submit.lock().await;
+    if slots.submitted_skus.contains(&sku_key) {
+        return AutoSubmitReserve::Drop("duplicate_sku");
+    }
+    if usable.is_empty() {
+        return AutoSubmitReserve::Drop("no_usable_ck");
+    }
+
+    let delay = Duration::from_secs(sanitize_auto_submit_delay_secs(delay_secs));
+    if usable.len() == 1 {
+        if slots.single_ck_reserved >= 2 {
+            slots.submitted_skus.insert(sku_key);
+            return AutoSubmitReserve::Drop("single_ck_queue_full");
+        }
+        let ck_index = usable[0];
+        let start_delay = reserve_single_ck_start(&mut slots, delay);
+        slots.single_ck_reserved += 1;
+        slots.submitted_skus.insert(sku_key.clone());
+        return AutoSubmitReserve::Run(AutoSubmitLease {
+            ck_index,
+            credential: creds[ck_index].clone(),
+            start_delay,
+            mode: AutoSubmitLeaseMode::SharedSingle,
+        });
+    }
+
+    let Some(ck_index) = usable
+        .into_iter()
+        .find(|idx| !slots.exclusive_ck_in_flight.contains(idx))
+    else {
+        slots.submitted_skus.insert(sku_key);
+        return AutoSubmitReserve::Drop("all_ck_busy");
+    };
+    slots.exclusive_ck_in_flight.insert(ck_index);
+    slots.submitted_skus.insert(sku_key.clone());
+    AutoSubmitReserve::Run(AutoSubmitLease {
+        ck_index,
+        credential: creds[ck_index].clone(),
+        start_delay: Duration::ZERO,
+        mode: AutoSubmitLeaseMode::Exclusive,
+    })
+}
+
+async fn release_auto_submit(state: &AppState, lease: &AutoSubmitLease) {
+    let mut slots = state.auto_submit.lock().await;
+    match lease.mode {
+        AutoSubmitLeaseMode::Exclusive => {
+            slots.exclusive_ck_in_flight.remove(&lease.ck_index);
+        }
+        AutoSubmitLeaseMode::SharedSingle => {
+            slots.single_ck_reserved = slots.single_ck_reserved.saturating_sub(1);
+        }
+    }
+}
+
+async fn apply_auto_credential_update(
+    state: &AppState,
+    lease: &AutoSubmitLease,
+    updated: Credential,
+) {
+    let mut creds = state.creds.lock().await;
+    let Some(slot) = creds.get_mut(lease.ck_index) else {
+        return;
+    };
+    if slot.name == lease.credential.name && slot.cookie_str == lease.credential.cookie_str {
+        slot.status = updated.status;
+        slot.valid = updated.valid;
+        persist(state, KV_CREDS, &*creds);
     }
 }
 
@@ -644,8 +848,16 @@ fn record_order(
         now_ms(),
         result.success,
         trigger,
-        if inspect_id.is_empty() { &result.inspect_sku_id } else { inspect_id },
-        if youpin_id.is_empty() { &result.youpin_sku_id } else { youpin_id },
+        if inspect_id.is_empty() {
+            &result.inspect_sku_id
+        } else {
+            inspect_id
+        },
+        if youpin_id.is_empty() {
+            &result.youpin_sku_id
+        } else {
+            youpin_id
+        },
         short_name,
         &result.price,
         quality,
@@ -657,7 +869,11 @@ fn record_order(
     );
     match store.insert(&rec) {
         Ok(saved) => {
-            emit(app, "order_recorded", serde_json::to_value(&saved).unwrap_or(json!({})));
+            emit(
+                app,
+                "order_recorded",
+                serde_json::to_value(&saved).unwrap_or(json!({})),
+            );
             // Mirror the order record up to the server as an audit record.
             // Best-effort: try_lock so a contended/missing connection never blocks
             // or fails the local record path.
@@ -694,9 +910,15 @@ async fn on_sku_hit(app: AppHandle, state: Arc<AppState>, sku: Value) {
     let short_name = sku["short_name"].as_str().unwrap_or("").to_string();
     let quality = sku["quality_name"].as_str().unwrap_or("").to_string();
     let image = sku["main_image"].as_str().unwrap_or("").to_string();
-    let price = sku["price"].as_str().map(|s| s.to_string()).unwrap_or_else(|| {
-        sku["price"].as_f64().map(|f| f.to_string()).unwrap_or_default()
-    });
+    let price = sku["price"]
+        .as_str()
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| {
+            sku["price"]
+                .as_f64()
+                .map(|f| f.to_string())
+                .unwrap_or_default()
+        });
 
     // 未开启自动提交:这是「命中告警」场景 —— 推渠道提醒人工介入,然后结束(不自动下单)。
     if !cfg.auto_submit {
@@ -721,39 +943,66 @@ async fn on_sku_hit(app: AppHandle, state: Arc<AppState>, sku: Value) {
         return;
     }
 
-    relay_log(&app, &state, "hit", &format!("命中: {short_name} → 开始提交")).await;
-
     let ws = match state.ws.lock().await.as_ref().cloned() {
         Some(w) => w,
         None => return,
     };
 
-    // Serialize the whole attempt: snapshot creds/idx, run, write back — all
-    // under order_lock so concurrent attempts cannot stomp each other's state.
-    let _order_guard = state.order_lock.lock().await;
-    let creds = state.creds.lock().await.clone();
-    let active = *state.active_idx.lock().await;
+    let sku_key = auto_submit_key(&inspect_id, &youpin_id);
+    let lease = match reserve_auto_submit(&state, sku_key, cfg.auto_submit_delay_secs).await {
+        AutoSubmitReserve::Run(lease) => lease,
+        AutoSubmitReserve::Drop(reason) => {
+            mirror_log_to_server(
+                &state,
+                "info",
+                &format!(
+                    "[自动下单调度] 丢弃命中: {short_name} ({youpin_id}/{inspect_id}) reason={reason}"
+                ),
+            )
+            .await;
+            return;
+        }
+    };
+
+    if !lease.start_delay.is_zero() {
+        mirror_log_to_server(
+            &state,
+            "info",
+            &format!(
+                "[自动下单间隔] 等待 {}毫秒后提交下一件",
+                lease.start_delay.as_millis()
+            ),
+        )
+        .await;
+        tokio::time::sleep(lease.start_delay).await;
+    }
+    relay_log(
+        &app,
+        &state,
+        "hit",
+        &format!(
+            "命中: {short_name} → 使用凭证 {} 开始提交",
+            lease.credential.name
+        ),
+    )
+    .await;
 
     let mut logs: Vec<String> = Vec::new();
     let order_start = std::time::Instant::now();
-    let (result, updated, new_active) = order::order_with_rotation_probe(
-        &ws, creds, active, &inspect_id, &youpin_id, &mut logs,
+    let (result, updated_credential) = order::order_with_assigned_credential_probe(
+        &ws,
+        lease.credential.clone(),
+        &inspect_id,
+        &youpin_id,
+        &mut logs,
     )
     .await;
     let elapsed_ms = order_start.elapsed().as_millis() as u64;
-    for m in logs {
-        emit(&app, "log", json!({"msg": m}));
+    for m in &logs {
+        publish_order_log(&app, &state, m).await;
     }
-
-    // Persist rotation outcome (still under order_lock).
-    {
-        let new_creds = updated;
-        let mut creds_guard = state.creds.lock().await;
-        let len = new_creds.len();
-        *creds_guard = new_creds;
-        let mut idx_guard = state.active_idx.lock().await;
-        *idx_guard = if len == 0 { 0 } else { new_active.min(len - 1) };
-    }
+    apply_auto_credential_update(&state, &lease, updated_credential).await;
+    release_auto_submit(&state, &lease).await;
 
     if result.success {
         // quota: used += 1; auto-stop if reached, mirror to server — both under
@@ -763,12 +1012,25 @@ async fn on_sku_hit(app: AppHandle, state: Arc<AppState>, sku: Value) {
             let stopped = rules::record_success(&mut rules, &rule_id);
             (stopped, rules.clone())
         };
-        ws.set_rules(&serde_json::to_value(&rules_now).unwrap_or(json!([]))).ok();
+        ws.set_rules(&serde_json::to_value(&rules_now).unwrap_or(json!([])))
+            .ok();
         persist(&state, KV_RULES, &rules_now);
-        relay_log(&app, &state, "hit", &format!(
-            "提交成功 #{} ¥{}{}", result.order_id, result.price,
-            if stopped { " (规则已达上限,自动停止)" } else { "" }
-        )).await;
+        relay_log(
+            &app,
+            &state,
+            "hit",
+            &format!(
+                "提交成功 #{} ¥{}{}",
+                result.order_id,
+                result.price,
+                if stopped {
+                    " (规则已达上限,自动停止)"
+                } else {
+                    ""
+                }
+            ),
+        )
+        .await;
         let link = order::product_link(&youpin_id, &inspect_id);
         notifier
             .notify(NotifyEvent::OrderSuccess(OrderOutcome {
@@ -816,7 +1078,16 @@ async fn on_sku_hit(app: AppHandle, state: Arc<AppState>, sku: Value) {
 
     // Persist to local history (success or failure), then notify the frontend.
     record_order(
-        &app, &state, &result, "auto", &inspect_id, &youpin_id, &short_name, &quality, &image, &rule_id,
+        &app,
+        &state,
+        &result,
+        "auto",
+        &inspect_id,
+        &youpin_id,
+        &short_name,
+        &quality,
+        &image,
+        &rule_id,
     );
 }
 
@@ -832,13 +1103,20 @@ pub async fn start_watch(
     state: State<'_, Arc<AppState>>,
     category_keys: Vec<String>,
 ) -> Result<(), String> {
-    let ws = state.ws.lock().await.as_ref().cloned().ok_or("研究功能尚未就绪")?;
+    let ws = state
+        .ws
+        .lock()
+        .await
+        .as_ref()
+        .cloned()
+        .ok_or("研究功能尚未就绪")?;
     let rules = state.rules.lock().await.clone();
 
     if category_keys.is_empty() {
         return Err("请至少选择一个关注品类".into());
     }
 
+    state.auto_submit.lock().await.clear_submitted_skus();
     ws.set_rules(&serde_json::to_value(&rules).unwrap_or(json!([])))?;
     ws.watch_config(&json!({ "category_keys": category_keys }))?;
     ws.start_watch()?;
@@ -862,18 +1140,26 @@ pub async fn manual_submit(
     youpin_id: String,
 ) -> Result<Value, String> {
     // 签名走 WS 服务端(probe 裸签 tk06);body+发送用 probe 库。需 WS 连接。
-    let ws = state.ws.lock().await.as_ref().cloned().ok_or("研究功能尚未就绪")?;
+    let ws = state
+        .ws
+        .lock()
+        .await
+        .as_ref()
+        .cloned()
+        .ok_or("研究功能尚未就绪")?;
     // Same serialization + write-back-clamp as auto submit.
     let _order_guard = state.order_lock.lock().await;
     let creds = state.creds.lock().await.clone();
     let active = *state.active_idx.lock().await;
     let mut logs = Vec::new();
     let order_start = std::time::Instant::now();
-    let (result, updated, new_active) = order::order_with_rotation_probe(
-        &ws, creds, active, &inspect_id, &youpin_id, &mut logs,
-    )
-    .await;
+    let (result, updated, new_active) =
+        order::order_with_rotation_probe(&ws, creds, active, &inspect_id, &youpin_id, &mut logs)
+            .await;
     let elapsed_ms = order_start.elapsed().as_millis() as u64;
+    for m in &logs {
+        mirror_log_to_server(&state, "info", m).await;
+    }
     {
         let len = updated.len();
         *state.creds.lock().await = updated;
@@ -883,7 +1169,16 @@ pub async fn manual_submit(
     // Persist to local history (manual trigger, no rule). Manual submit has no
     // product name/quality/image (user enters only the SKU ids), so those stay empty.
     record_order(
-        &app, &state, &result, "manual", &inspect_id, &youpin_id, "", "", "", "",
+        &app,
+        &state,
+        &result,
+        "manual",
+        &inspect_id,
+        &youpin_id,
+        "",
+        "",
+        "",
+        "",
     );
 
     // 渠道推送:手动提交与自动命中走同一套 Notifier,成交成功/失败都推(渠道按各自
@@ -913,10 +1208,11 @@ pub async fn manual_submit(
         notifier.notify(event).await;
     }
 
+    let visible_logs: Vec<&String> = logs.iter().filter(|m| !is_order_timing_log(m)).collect();
     Ok(json!({
         "success": result.success, "order_id": result.order_id,
         "price": result.price, "error": result.error,
-        "credential": result.credential, "logs": logs
+        "credential": result.credential, "logs": visible_logs
     }))
 }
 
@@ -957,13 +1253,22 @@ pub async fn clear_orders(state: State<'_, Arc<AppState>>) -> Result<(), String>
 pub async fn ping_jd(state: State<'_, Arc<AppState>>) -> Result<Value, String> {
     let client = &state.http.client;
     let net = timed(|| async {
-        client.get("https://item.m.jd.com/").send().await.map(|_| ()).map_err(|e| e.to_string())
+        client
+            .get("https://item.m.jd.com/")
+            .send()
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string())
     })
     .await;
     let api = timed(|| async {
         client
             .post("https://api.m.jd.com/api")
-            .form(&[("appid", "paipai_inspect"), ("functionId", "x"), ("body", "{}")])
+            .form(&[
+                ("appid", "paipai_inspect"),
+                ("functionId", "x"),
+                ("body", "{}"),
+            ])
             .send()
             .await
             .map(|_| ())
@@ -1045,6 +1350,15 @@ pub fn run() {
 mod tests {
     use super::*;
 
+    fn test_credential(name: &str) -> Credential {
+        Credential {
+            name: name.to_string(),
+            cookie_str: format!("pt_key={name}; pt_pin={name}; visitkey={name}"),
+            status: ck::CredStatus::Active,
+            valid: true,
+        }
+    }
+
     #[test]
     fn master_key_constant_is_32_bytes() {
         // 编译期注入或本地占位,任一路径都必须产出 32 字节 key。
@@ -1060,5 +1374,86 @@ mod tests {
         let p = crate::core::access_token::decrypt_access_token(token, &master_key()).unwrap();
         assert_eq!(p.url, "wss://real.example.com:8443/ws");
         assert_eq!(p.tok, "sk-h5st-abc");
+    }
+
+    #[tokio::test]
+    async fn auto_submit_assigns_distinct_ck_and_drops_extra_hit() {
+        let state = AppState::new();
+        *state.creds.lock().await = vec![test_credential("a"), test_credential("b")];
+
+        let first = reserve_auto_submit(&state, "i1|y1".into(), 1).await;
+        let second = reserve_auto_submit(&state, "i2|y2".into(), 1).await;
+        let third = reserve_auto_submit(&state, "i3|y3".into(), 1).await;
+
+        let AutoSubmitReserve::Run(first) = first else {
+            panic!("first hit should run");
+        };
+        let AutoSubmitReserve::Run(second) = second else {
+            panic!("second hit should run");
+        };
+        assert_ne!(first.ck_index, second.ck_index);
+        assert!(first.start_delay.is_zero());
+        assert!(second.start_delay.is_zero());
+        assert!(matches!(third, AutoSubmitReserve::Drop("all_ck_busy")));
+    }
+
+    #[tokio::test]
+    async fn auto_submit_single_ck_accepts_two_with_start_delay() {
+        let state = AppState::new();
+        *state.creds.lock().await = vec![test_credential("a")];
+
+        let first = reserve_auto_submit(&state, "i1|y1".into(), 1).await;
+        let second = reserve_auto_submit(&state, "i2|y2".into(), 1).await;
+        let third = reserve_auto_submit(&state, "i3|y3".into(), 1).await;
+
+        let AutoSubmitReserve::Run(first) = first else {
+            panic!("first hit should run");
+        };
+        let AutoSubmitReserve::Run(second) = second else {
+            panic!("second hit should run");
+        };
+        assert_eq!(first.ck_index, second.ck_index);
+        assert!(first.start_delay.is_zero());
+        assert!(second.start_delay > Duration::ZERO);
+        assert!(matches!(
+            third,
+            AutoSubmitReserve::Drop("single_ck_queue_full")
+        ));
+    }
+
+    #[tokio::test]
+    async fn auto_submit_single_ck_uses_configured_delay() {
+        let state = AppState::new();
+        *state.creds.lock().await = vec![test_credential("a")];
+
+        let first = reserve_auto_submit(&state, "i1|y1".into(), 3).await;
+        let second = reserve_auto_submit(&state, "i2|y2".into(), 3).await;
+
+        let AutoSubmitReserve::Run(first) = first else {
+            panic!("first hit should run");
+        };
+        let AutoSubmitReserve::Run(second) = second else {
+            panic!("second hit should run");
+        };
+        assert!(first.start_delay.is_zero());
+        assert!(second.start_delay >= Duration::from_millis(2_900));
+        assert!(second.start_delay <= Duration::from_secs(3));
+    }
+
+    #[test]
+    fn auto_submit_delay_defaults_and_clamps() {
+        assert_eq!(AppConfig::default().auto_submit_delay_secs, 1);
+
+        let mut cfg = AppConfig::default();
+        cfg.auto_submit_delay_secs = 0;
+        assert_eq!(sanitize_config(cfg).auto_submit_delay_secs, 1);
+
+        let mut cfg = AppConfig::default();
+        cfg.auto_submit_delay_secs = 3;
+        assert_eq!(sanitize_config(cfg).auto_submit_delay_secs, 3);
+
+        let mut cfg = AppConfig::default();
+        cfg.auto_submit_delay_secs = 9;
+        assert_eq!(sanitize_config(cfg).auto_submit_delay_secs, 3);
     }
 }

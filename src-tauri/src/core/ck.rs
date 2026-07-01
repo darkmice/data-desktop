@@ -93,26 +93,25 @@ pub fn has_pt_key(cookies: &BTreeMap<String, String>) -> bool {
     cookies.contains_key("pt_key")
 }
 
-/// 下单必需的关键 cookie key(缺任一则该 CK 不可用于下单)。
-/// 只保留登录态与基础设备指纹项。移除 3AB9D23F7A4B3C9B / 3AB9D23F7A4B3CSS /
-/// shshshfpv —— JD app 端导出的 CK 不带这几项(它们是 H5/PC 端的字段),强制要求会
-/// 误拒 app 端有效 CK。签名走服务端 headless 现场种 __jda,不依赖这些字段。
-pub const REQUIRED_KEYS: &[&str] = &[
-    "pt_key",
-    "pt_pin",
-    "__jda",
-    "shshshfpa",
-    "shshshfpb",
-    "shshshfpx",
-    "unionwsws",
-];
+/// 导入准入只校验登录态 cookie。
+///
+/// JD app 端导出的可下单 CK 可能只有 `pt_key`/`pt_pin`/`pwdt_id`/`unpl` 这一类
+/// 登录字段,不带 `__jda`、`shshshfpa/b/x`、`unionwsws` 等 H5/PC 指纹字段。
+/// 下单 body 里的设备/地址字段有运行时兜底,所以导入阶段不能把这些非登录字段当
+/// 成硬门槛,否则会误拒真实可用 CK。
+pub const REQUIRED_KEYS: &[&str] = &["pt_key", "pt_pin"];
 
 /// 返回 CK 中缺失的关键 key(按 REQUIRED_KEYS 顺序)。空 = 齐全。
 /// 只判断"在不在"且值非空——不判断值是否正确。
 pub fn missing_required_keys(cookies: &BTreeMap<String, String>) -> Vec<&'static str> {
     REQUIRED_KEYS
         .iter()
-        .filter(|k| cookies.get(**k).map(|v| v.trim().is_empty()).unwrap_or(true))
+        .filter(|k| {
+            cookies
+                .get(**k)
+                .map(|v| v.trim().is_empty())
+                .unwrap_or(true)
+        })
         .copied()
         .collect()
 }
@@ -199,18 +198,25 @@ mod tests {
 
     #[test]
     fn missing_keys_lists_each_absent_required() {
-        // SAMPLE 只有 pt_key/__jda/3AB9D23F7A4B3C9B,缺其余必需项。
+        // SAMPLE 只有 pt_key,缺 pt_pin。
         let missing = missing_required_keys(&parse_cookies(SAMPLE));
         assert!(missing.contains(&"pt_pin"));
-        assert!(missing.contains(&"shshshfpa"));
-        assert!(missing.contains(&"shshshfpb"));
-        assert!(missing.contains(&"unionwsws"));
         assert!(!missing.contains(&"pt_key"));
+        // 这些 H5/PC 指纹字段已不再强制(app 端 CK 不带),即使缺也不算 missing。
         assert!(!missing.contains(&"__jda"));
-        // 这几项已不再强制(app 端 CK 不带),即使缺也不算 missing。
+        assert!(!missing.contains(&"shshshfpa"));
+        assert!(!missing.contains(&"shshshfpb"));
+        assert!(!missing.contains(&"shshshfpx"));
+        assert!(!missing.contains(&"unionwsws"));
         assert!(!missing.contains(&"3AB9D23F7A4B3C9B"));
         assert!(!missing.contains(&"3AB9D23F7A4B3CSS"));
         assert!(!missing.contains(&"shshshfpv"));
+    }
+
+    #[test]
+    fn app_exported_minimal_ck_passes_import_gate() {
+        let ck = "pt_key=app_open_x; pt_pin=jd_user; pwdt_id=jd_user; sid=; unpl=encoded";
+        assert!(missing_required_keys(&parse_cookies(ck)).is_empty());
     }
 
     #[test]
